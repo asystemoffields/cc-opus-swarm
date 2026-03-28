@@ -202,11 +202,21 @@ def launch_instance(project_dir: Path, role_name: str):
         f'claude --model {CLAUDE_MODEL}{" --dangerously-skip-permissions" if SKIP_PERMISSIONS else ""}\r\n',
         encoding="utf-8",
     )
-    # start opens a new console; the first quoted arg is the window title
-    subprocess.Popen(
-        f'start "Collab: {role_name}" cmd /k "{bat}"',
-        shell=True,
-    )
+    # Try Windows Terminal (persistent tab titles + colors that survive
+    # Claude Code overriding the console title). Fall back to plain `start`.
+    tab_title = role_name.upper().replace("DEV", "DEV ")
+    tab_color = colors["tab"]
+    wt_available = shutil.which("wt") is not None
+    if wt_available:
+        subprocess.Popen(
+            f'wt new-tab --title "{tab_title}" --tabColor "{tab_color}" cmd /k "{bat}"',
+            shell=True,
+        )
+    else:
+        subprocess.Popen(
+            f'start "Collab: {role_name}" cmd /k "{bat}"',
+            shell=True,
+        )
 
 
 def main():
