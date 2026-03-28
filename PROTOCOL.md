@@ -70,6 +70,7 @@ Short aliases for frequent commands — reduces token usage for Claude instances
 | `h` | `health` |
 | `w` | `windows` |
 | `n` | `nudge` |
+| `d` | `diff` |
 
 ### Node Management
 ```
@@ -134,21 +135,30 @@ Tasks are sorted by: active first, then by priority (critical > high > medium > 
 
 Dependencies: Use `--depends-on 1,2` to declare that a task depends on others. The `poll` and `task list` commands show when a task is blocked by unfinished dependencies.
 
+**Completion triggers:** When a task is marked `done`, any tasks that depended on it are checked. If all their dependencies are now complete, the assignee is automatically notified ("Task #5 UNBLOCKED").
+
 ### File Coordination
 ```
 collab lock <you> "<filepath>"     # Acquire exclusive lock
-collab unlock <you> "<filepath>"   # Release lock
+collab unlock <you> "<filepath>"   # Release lock (broadcasts git diff to others)
 collab locks                       # List all active locks
+collab reap                        # Reclaim locks/tasks from stale nodes
+collab reap <node>                 # Reap a specific node
 ```
 
 Lock the specific files you're about to edit, not entire directories.
 
+**Unlock broadcasts changes:** When you unlock a file, git diff stats are automatically captured and broadcast to other nodes, so they know what you changed without asking.
+
 **Lock expiry:** Locks automatically expire after 30 minutes. The `poll` command reports any expired locks. This prevents dead locks from blocking progress when a node crashes.
+
+**Crash recovery (`reap`):** If a node goes stale (no heartbeat for >5 minutes), `reap` releases its locks and resets its active/claimed tasks to `open` so other nodes can pick them up. Run `reap` with no argument to auto-detect and reclaim all stale nodes, or `reap <name>` to target one.
 
 ### Polling & Activity
 ```
 collab pending <you>         # Quick signal check (fast! run after every file write) (alias: pd)
 collab poll <you>            # Everything new since your last poll (full details) (alias: p)
+collab diff <you>            # What changed in the repo while you were working (alias: d)
 collab log --limit 30        # Recent activity across all nodes
 ```
 
@@ -219,6 +229,17 @@ Full protocol: /path/to/claude-collab/PROTOCOL.md
 ```
 
 > **Note:** You don't need to write this manually. The `launcher.py` script auto-generates this block with correct absolute paths when you launch a session.
+
+## Session Resume
+
+If terminals close or instances crash, the session state is fully preserved on disk.
+To resume:
+
+```bash
+python launcher.py /path/to/project --resume
+```
+
+This re-launches all terminals from the previous session without resetting state. Tasks, messages, context, and locks are all preserved. Each relaunched instance just needs to re-join and poll to pick up where it left off.
 
 ---
 

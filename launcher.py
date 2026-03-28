@@ -232,7 +232,7 @@ If a command fails, follow these steps before asking for help:
 
 ### Command Reference
 
-**Aliases:** s=status, p=poll, pd=pending, b=broadcast, t=task, c=context, h=health, w=windows, n=nudge
+**Aliases:** s=status, p=poll, pd=pending, b=broadcast, t=task, c=context, h=health, w=windows, n=nudge, d=diff
 
 **Every interaction** (use constantly):
 ```
@@ -259,12 +259,13 @@ python "{COLLAB_PY_BASH}" task show <id>                          # Full details
 python "{COLLAB_PY_BASH}" context set "<key>" "<val>" --by <you>  # Share info (alias: c)
 ```
 
-**Diagnostics (when needed):**
+**Awareness:**
 ```
-python "{COLLAB_PY_BASH}" status                                  # Full overview (alias: s)
-python "{COLLAB_PY_BASH}" health                                  # Node health (alias: h)
-python "{COLLAB_PY_BASH}" locks                                   # Active file locks
-python "{COLLAB_PY_BASH}" windows                                 # Detected consoles (alias: w)
+python "{COLLAB_PY_BASH}" diff <you>                               # What changed while you worked (alias: d)
+python "{COLLAB_PY_BASH}" status                                   # Full overview (alias: s)
+python "{COLLAB_PY_BASH}" health                                   # Node health (alias: h)
+python "{COLLAB_PY_BASH}" locks                                    # Active file locks
+python "{COLLAB_PY_BASH}" reap                                     # Reclaim stale node resources
 ```
 
 **Lead-only (terminal control):**
@@ -609,6 +610,106 @@ def launch_instance(project_dir: Path, role_name: str):
         _launch_unix_terminal(project_dir, role_name)
 
 
+def _read_session_state() -> dict:
+    """Read existing nodes.json to discover the previous session's nodes."""
+    nodes_file = STATE_DIR / "nodes.json"
+    if not nodes_file.exists():
+        return {}
+    try:
+        import json
+        return json.loads(nodes_file.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _build_resume_summary() -> str:
+    """Build a text summary of session state for the resume prompt."""
+    import json
+    lines = []
+    tasks_file = STATE_DIR / "tasks.json"
+    nodes_file = STATE_DIR / "nodes.json"
+
+    if nodes_file.exists():
+        try:
+            nodes = json.loads(nodes_file.read_text(encoding="utf-8"))
+            names = list(nodes.keys())
+            lines.append(f"Previous nodes: {', '.join(names)}")
+            for n, info in nodes.items():
+                working = info.get("working_on", "")
+                status = info.get("status", "?")
+                if working:
+                    lines.append(f"  {n} was: {status}, working on: {working}")
+        except Exception:
+            pass
+
+    if tasks_file.exists():
+        try:
+            tasks = json.loads(tasks_file.read_text(encoding="utf-8"))
+            active = [(tid, t) for tid, t in tasks.items()
+                      if t["status"] in ("active", "claimed", "open")]
+            done = [t for t in tasks.values() if t["status"] == "done"]
+            lines.append(f"Tasks: {len(done)} done, {len(active)} in progress/open")
+            for tid, t in active:
+                assignee = t.get("assigned_to", "unassigned")
+                lines.append(f"  #{tid} [{t['status']}] {t['title']} (-> {assignee})")
+        except Exception:
+            pass
+
+    return "\n".join(lines) if lines else "No previous state found."
+
+
+def resume_session(project_dir: Path, tier: str):
+    """Resume a previous collaboration session — re-launch terminals without resetting state."""
+    nodes = _read_session_state()
+    if not nodes:
+        print("  [ERROR] No previous session found (state/nodes.json missing or empty).")
+        print("  Use a normal launch instead: python launcher.py <project_dir>")
+        sys.exit(1)
+
+    num_nodes = len(nodes)
+    role_names = sorted(nodes.keys(), key=lambda n: (n != "lead", n))
+
+    print(f"  Resuming session with {num_nodes} node(s): {', '.join(role_names)}")
+    print()
+
+    summary = _build_resume_summary()
+    print(f"  Session state:\n")
+    for line in summary.splitlines():
+        print(f"    {line}")
+    print()
+
+    # Re-inject CLAUDE.md (state is preserved, just refresh instructions)
+    print("  Refreshing CLAUDE.md...")
+    setup_claude_md(project_dir, num_nodes, tier)
+
+    # Re-launch terminals
+    print(f"\n  Re-launching {num_nodes} instance(s)...\n")
+    for i, role_name in enumerate(role_names):
+        launch_instance(project_dir, role_name)
+        desc = nodes[role_name].get("role", "")
+        print(f"    {role_name:<8} {desc}")
+        if i < num_nodes - 1:
+            time.sleep(2)
+
+    using_tmux = sys.platform != "win32" and shutil.which("tmux")
+    print(f"""
+  ==========================================
+     {num_nodes} instance(s) resumed!
+  ==========================================
+
+  State was PRESERVED — all tasks, messages, and context intact.
+
+  In EACH window, tell the instance to resume:
+
+      Resume the collaboration session. Run `echo $COLLAB_ROLE` to
+      find your role, join, poll for state, and pick up where you
+      left off. Check your assigned tasks and continue working.
+
+  Session state:
+    {summary.replace(chr(10), chr(10) + '    ')}
+""")
+
+
 def main():
     import argparse as _ap
     parser = _ap.ArgumentParser(
@@ -623,7 +724,26 @@ def main():
                         help="Protocol tier: full (Opus), lite (Haiku/Sonnet), auto (detect from model)")
     parser.add_argument("--stop", action="store_true",
                         help="Clean up: remove collab instructions from CLAUDE.md and reset state")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume a previous session — re-launch terminals, preserve state")
     args = parser.parse_args()
+
+    # ── Resume mode: re-launch without resetting ──
+    if args.resume:
+        project_dir = Path(args.project_dir).resolve() if args.project_dir else Path.cwd()
+        if not project_dir.is_dir():
+            print(f"  [ERROR] Not a directory: {project_dir}")
+            sys.exit(1)
+        tier = args.tier or COLLAB_TIER
+        if tier == "auto":
+            tier = _detect_tier(CLAUDE_MODEL)
+        print()
+        print("=" * 52)
+        print("   Claude Code Collaboration — RESUME")
+        print("=" * 52)
+        print()
+        resume_session(project_dir, tier)
+        return
 
     # ── Stop mode: clean up and exit ──
     if args.stop:

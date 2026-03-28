@@ -813,6 +813,25 @@ def cmd_task_update(state: State, task_id: int, new_status: str,
     state.append_log(by, "task_updated", log_msg)
     print(f"[OK] Task #{task_id} -> {new_status}")
 
+    # ── Completion trigger: notify dependents that their blocker cleared ──
+    if new_status == "done":
+        tasks = state.read("tasks")
+        for tid, t in tasks.items():
+            deps = t.get("depends_on", [])
+            if task_id not in deps and str(task_id) not in [str(d) for d in deps]:
+                continue
+            # This task depended on the one just completed — check if fully unblocked
+            still_blocked = any(
+                tasks.get(str(d), {}).get("status") != "done"
+                for d in deps if str(d) != str(task_id)
+            )
+            assignee = t.get("assigned_to")
+            if not still_blocked and assignee:
+                signal_node(state.dir, assignee,
+                            f"Task #{tid} UNBLOCKED — #{task_id} is done, all deps clear")
+                state.append_log("system", "unblocked",
+                                 f"Task #{tid} unblocked (#{task_id} done) — notified {assignee}")
+
 
 def cmd_task_show(state: State, task_id: int):
     tasks = state.read("tasks")
@@ -942,6 +961,28 @@ def cmd_lock(state: State, name: str, filepath: str):
     print(f'[OK] Locked "{filepath}"')
 
 
+def _git_diff_summary(filepath: str) -> str:
+    """Best-effort: get a one-line git diff stat for a file. Returns '' on failure."""
+    try:
+        r = subprocess.run(
+            ["git", "diff", "--stat", "--", filepath],
+            capture_output=True, text=True, timeout=5,
+        )
+        # Also check staged changes
+        if not r.stdout.strip():
+            r = subprocess.run(
+                ["git", "diff", "--cached", "--stat", "--", filepath],
+                capture_output=True, text=True, timeout=5,
+            )
+        lines = [l.strip() for l in r.stdout.strip().splitlines() if l.strip()]
+        # Last line of --stat is the summary like "1 file changed, 5 insertions(+), 2 deletions(-)"
+        if lines:
+            return lines[-1]
+    except Exception:
+        pass
+    return ""
+
+
 def cmd_unlock(state: State, name: str, filepath: str):
     _touch_heartbeat(state, name)
     def _do(locks):
@@ -960,8 +1001,25 @@ def cmd_unlock(state: State, name: str, filepath: str):
         print(f'[ERROR] Cannot unlock "{filepath}" — locked by "{holder}", not you')
         print(f'  Only "{holder}" can unlock it, or it will auto-expire after {FILE_LOCK_EXPIRY // 60}m')
         sys.exit(1)
-    state.append_log(name, "unlocked", f'{name} unlocked "{filepath}"')
+
+    # Capture diff summary and broadcast to other nodes
+    diff_info = _git_diff_summary(filepath)
+    log_detail = f'{name} unlocked "{filepath}"'
+    if diff_info:
+        log_detail += f" ({diff_info})"
+
+    state.append_log(name, "unlocked", log_detail)
+
+    # Notify other nodes about the change
+    nodes = state.read("nodes")
+    others = [n for n in nodes if n != name]
+    if others and diff_info:
+        for other in others:
+            signal_node(state.dir, other, f'{name} changed "{filepath}" ({diff_info})')
+
     print(f'[OK] Unlocked "{filepath}"')
+    if diff_info:
+        print(f"     Changes: {diff_info}")
 
 
 def cmd_locks(state: State):
@@ -1200,6 +1258,75 @@ def cmd_log(state: State, limit: int = 20):
         print(f"  [{short_time(e['at'])}] {e['summary']}")
 
 
+# ── Diff (what did I miss?) ───────────────────────────────────
+
+def cmd_diff(state: State, name: str):
+    """Show repo changes by other agents since your last poll.
+    Uses the activity log to find unlock events (which carry diff stats),
+    plus a git log filtered to the time window."""
+    _touch_heartbeat(state, name)
+    nodes = state.read("nodes")
+    if name not in nodes:
+        print(f'[ERROR] Node "{name}" not found')
+        sys.exit(1)
+
+    last_poll = nodes[name].get("last_poll", "1970-01-01T00:00:00+00:00")
+    log_data = state.read("log")
+
+    # Collect unlock/file-change events from others since last poll
+    changes = [
+        e for e in log_data
+        if e["at"] > last_poll
+        and e.get("actor") != name
+        and e["action"] in ("unlocked", "locked")
+    ]
+
+    # Also try git log since last_poll
+    git_changes = []
+    try:
+        since = parse_ts(last_poll).strftime("%Y-%m-%dT%H:%M:%S")
+        r = subprocess.run(
+            ["git", "log", f"--since={since}", "--oneline", "--stat", "--no-merges"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.stdout.strip():
+            git_changes = r.stdout.strip().splitlines()
+    except Exception:
+        pass
+
+    if _json_mode:
+        return _emit_json({
+            "command": "diff",
+            "node": name,
+            "since": last_poll,
+            "collab_changes": changes,
+            "git_log": git_changes,
+        })
+
+    if not changes and not git_changes:
+        print(f"No changes by others since your last poll ({ago(last_poll)}).")
+        return
+
+    print(f'=== What changed since your last poll ({ago(last_poll)}) ===\n')
+
+    if changes:
+        print(f"File activity by others ({len(changes)}):")
+        for e in changes[-20:]:
+            print(f"  [{short_time(e['at'])}] {e['summary']}")
+        print()
+
+    if git_changes:
+        limit = 30 if not _brief_mode else 15
+        shown = git_changes[:limit]
+        print(f"Git log ({len(git_changes)} lines, showing {len(shown)}):")
+        for line in shown:
+            print(f"  {line}")
+        if len(git_changes) > limit:
+            print(f"  ... ({len(git_changes) - limit} more lines)")
+
+    print()
+
+
 # ── Request ───────────────────────────────────────────────────
 
 def cmd_request(state: State, from_node: str, to_node: str, description: str):
@@ -1344,6 +1471,101 @@ def cmd_summary(state: State):
             print(f"    {fp} -> {info['held_by']} ({ago(info.get('acquired_at', ''))})")
 
     print()
+
+
+# ── Crash Recovery ───────────────────────────────────────────
+
+def cmd_reap(state: State, target: str = ""):
+    """Reclaim resources from stale (crashed/hung) nodes.
+    If target is given, reap that specific node. Otherwise reap all stale nodes.
+    Releases their locks, resets their active/claimed tasks to open."""
+    nodes = state.read("nodes")
+    now = datetime.now(timezone.utc)
+
+    # Determine which nodes to reap
+    if target:
+        if target not in nodes:
+            print(f'[ERROR] Node "{target}" not found')
+            sys.exit(1)
+        to_reap = [target]
+    else:
+        # Auto-detect stale nodes
+        to_reap = []
+        for n, info in nodes.items():
+            hb = info.get("last_heartbeat", info.get("joined_at", ""))
+            if hb:
+                try:
+                    age = (now - parse_ts(hb)).total_seconds()
+                    if age > STALE_NODE_SEC:
+                        to_reap.append(n)
+                except Exception:
+                    pass
+
+    if not to_reap:
+        print("[ok] No stale nodes to reap.")
+        return
+
+    total_locks = 0
+    total_tasks = 0
+
+    for node_name in to_reap:
+        # Release locks
+        def _release_locks(locks, _name=node_name):
+            released = [f for f, v in locks.items() if v["held_by"] == _name]
+            for f in released:
+                del locks[f]
+            return released
+        released = state.update("locks", _release_locks)
+        total_locks += len(released)
+
+        # Reset active/claimed tasks to open
+        def _reset_tasks(tasks, _name=node_name):
+            reset = []
+            for tid, t in tasks.items():
+                if t.get("assigned_to") == _name and t["status"] in ("active", "claimed"):
+                    t["status"] = "open"
+                    t["assigned_to"] = ""
+                    t["updated_at"] = utcnow()
+                    t["history"].append({
+                        "action": f"reaped: {_name} stale, reset to open",
+                        "by": "system", "at": utcnow(),
+                    })
+                    reset.append(int(tid))
+            return reset
+        reset_tasks = state.update("tasks", _reset_tasks)
+        total_tasks += len(reset_tasks)
+
+        state.append_log("system", "reaped",
+                         f'Reaped {node_name}: {len(released)} lock(s), {len(reset_tasks)} task(s) reset')
+
+        if _json_mode:
+            continue
+
+        print(f'  Reaped "{node_name}":')
+        if released:
+            for f in released:
+                print(f"    Released lock: {f}")
+        if reset_tasks:
+            for tid in reset_tasks:
+                print(f"    Task #{tid} reset to open")
+        if not released and not reset_tasks:
+            print(f"    (no resources held)")
+
+    # Notify surviving nodes
+    surviving = [n for n in nodes if n not in to_reap]
+    reap_summary = f"Reaped {', '.join(to_reap)}: {total_locks} lock(s) freed, {total_tasks} task(s) reopened"
+    for s in surviving:
+        signal_node(state.dir, s, reap_summary)
+
+    if _json_mode:
+        return _emit_json({
+            "command": "reap",
+            "reaped": to_reap,
+            "locks_released": total_locks,
+            "tasks_reset": total_tasks,
+        })
+
+    print(f"\n[OK] Reaped {len(to_reap)} node(s): {total_locks} lock(s) freed, {total_tasks} task(s) reopened")
 
 
 # ── Window Control Commands ───────────────────────────────────
@@ -1601,6 +1823,7 @@ ALIASES = {
     "h":  "health",
     "w":  "windows",
     "n":  "nudge",
+    "d":  "diff",
 }
 
 
@@ -1772,6 +1995,11 @@ examples:
 
     sub.add_parser("locks", help="List all active file locks")
 
+    # ── reap ──
+    rp = sub.add_parser("reap", help="Reclaim resources from stale/crashed nodes")
+    rp.add_argument("target", nargs="?", default="",
+                    help="Specific node to reap (default: all stale nodes)")
+
     # ── pending ──
     pd = sub.add_parser("pending", help="Quick check: any signals, messages, or tasks waiting?")
     pd.add_argument("name", help="Your node name")
@@ -1783,6 +2011,10 @@ examples:
     # ── log ──
     lg = sub.add_parser("log", help="View the activity log")
     lg.add_argument("--limit", type=int, default=20, help="Number of entries")
+
+    # ── diff ──
+    df = sub.add_parser("diff", help="Show repo changes by others since your last poll")
+    df.add_argument("name", help="Your node name")
 
     # ── request ──
     rq = sub.add_parser("request", help="Request work from another node (task + message)")
@@ -1904,12 +2136,16 @@ def main():
             cmd_unlock(state, args.name, args.file)
         elif cmd == "locks":
             cmd_locks(state)
+        elif cmd == "reap":
+            cmd_reap(state, args.target)
         elif cmd == "pending":
             cmd_pending(state, args.name)
         elif cmd == "poll":
             cmd_poll(state, args.name)
         elif cmd == "log":
             cmd_log(state, args.limit)
+        elif cmd == "diff":
+            cmd_diff(state, args.name)
         elif cmd == "request":
             cmd_request(state, args.from_node, args.to, args.description)
         elif cmd == "inject":
