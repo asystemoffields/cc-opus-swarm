@@ -194,10 +194,14 @@ You are an **autonomous developer**, not a passive worker. Take initiative when 
 
 ### Ongoing Protocol (follow throughout the entire session)
 
-**After every file write or task completion**, run:
+**Messages and task assignments now auto-push a `pending` check into your terminal.**
+You'll see signals appear automatically. When they do, run a full poll:
 ```bash
-python "{COLLAB_PY_BASH}" pending <your-name>   # fast check — if signals found, immediately run:
-python "{COLLAB_PY_BASH}" poll <your-name>       # full update
+python "{COLLAB_PY_BASH}" poll <your-name>       # full update — run when you see pending signals
+```
+You can still manually check anytime:
+```bash
+python "{COLLAB_PY_BASH}" pending <your-name>   # fast manual check (alias: pd)
 ```
 
 **Before/after editing any file:**
@@ -239,10 +243,11 @@ python "{COLLAB_PY_BASH}" lock <you> "<file>"                     # Before editi
 python "{COLLAB_PY_BASH}" unlock <you> "<file>"                   # After editing
 ```
 
-**Communication:**
+**Communication** (all messages auto-push to the target's terminal):
 ```
 python "{COLLAB_PY_BASH}" send <you> <them> "<msg>"              # Direct message
 python "{COLLAB_PY_BASH}" broadcast <you> "<msg>"                 # Message all (alias: b)
+python "{COLLAB_PY_BASH}" btw <you> <them> "<msg>"               # Async FYI — no reply needed
 python "{COLLAB_PY_BASH}" inbox <you>                             # Read messages
 ```
 

@@ -88,6 +88,8 @@ collab validate --repair                     # Auto-fix detected issues
 ```
 collab send <you> <them> "<message>"         # Direct message
 collab broadcast <you> "<message>"           # Message to all nodes (alias: b)
+collab btw <you> <them> "<message>"          # Async FYI — pushed to their terminal
+collab btw <you> all "<message>"             # Async FYI to everyone
 collab inbox <you>                           # New messages since last poll
 collab inbox <you> --all                     # All messages ever
 collab request <you> <them> "<description>"  # Create task + notify them
@@ -156,10 +158,16 @@ The `poll` command now shows:
 - **Your assigned tasks** — with priority and dependency status
 - **Messages and activity** — from other nodes since last poll
 
-**Signal files:** When someone sends you a message, assigns you a task, or broadcasts,
-a signal file is created at `state/_signal_<your-name>`. The `pending` command reads
-and clears this file. This means you can detect new work without running the heavier
-`poll` command. Run `pending` after every file write; if it shows signals, run `poll`.
+**Auto-push notifications:** When someone sends you a message, assigns you a task, or
+broadcasts, a `pending` check is automatically injected into your terminal — you'll see
+new signals without having to remember to poll. A signal file is also written to
+`state/_signal_<your-name>` as a fallback. If auto-push can't reach your terminal (e.g.
+injection backend unavailable), the signal file ensures you see it on your next manual
+`pending` check.
+
+**`btw` — async FYI notes:** Use `btw` for non-blocking notifications that don't need
+a reply: "btw, I renamed that helper" or "heads up, tests are slow right now". Like
+`send` but semantically signals "no action required, just keeping you in the loop".
 
 ### JSON Output Mode
 

@@ -102,15 +102,19 @@ def _emit_json(data: dict):
 def _signal_path(state_dir: Path, node: str) -> Path:
     return state_dir / f"_signal_{node}"
 
-def signal_node(state_dir: Path, node: str, reason: str):
+def signal_node(state_dir: Path, node: str, reason: str, *, push: bool = True):
     """Touch a signal file for a node so it knows to poll.
-    The file contains the reason, appended line by line."""
+    The file contains the reason, appended line by line.
+    If push=True (default), also inject a `pending` command into the
+    node's terminal so it sees the notification without actively polling."""
     p = _signal_path(state_dir, node)
     try:
         with open(str(p), "a", encoding="utf-8") as f:
             f.write(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {reason}\n")
     except OSError:
         pass
+    if push:
+        _push_pending(node)
 
 def read_and_clear_signal(state_dir: Path, node: str) -> list:
     """Read all pending signal lines and clear the file. Returns list of strings."""
@@ -123,6 +127,20 @@ def read_and_clear_signal(state_dir: Path, node: str) -> list:
     except OSError:
         pass
     return lines
+
+
+def _push_pending(node: str):
+    """Best-effort: inject a `pending <node>` command into the node's terminal.
+    Silent no-op if injection backend is unavailable or the terminal isn't found."""
+    try:
+        if _injection_backend is None:
+            return
+        if not _injection_backend.find_target(node):
+            return
+        collab_path = str(SCRIPT_PATH).replace("\\", "/")
+        _injection_backend.inject(node, f'python "{collab_path}" --brief pending {node}')
+    except Exception:
+        pass  # best-effort — never disrupt the caller
 
 
 # ── Cross-Platform Window Control (via inject.py) ─────────────
@@ -540,6 +558,38 @@ def cmd_broadcast(state: State, from_node: str, message: str):
         signal_node(state.dir, other, f"Broadcast from {from_node}")
     state.append_log(from_node, "broadcast", f'{from_node} -> all: "{trunc(message, 50)}"')
     print(f"[OK] Broadcast sent ({len(others)} other node(s))")
+
+
+def cmd_btw(state: State, from_node: str, to_node: str, message: str):
+    """Low-priority async note — delivered as a message with push notification.
+    Use for non-blocking FYIs: 'btw, I renamed that helper' or 'heads up, tests are slow'.
+    Like send but semantically signals 'no reply needed, just so you know'."""
+    _touch_heartbeat(state, from_node)
+    nodes = state.read("nodes")
+    targets = []
+    if to_node == "all":
+        targets = [n for n in nodes if n != from_node]
+    else:
+        if to_node not in nodes:
+            active = ", ".join(sorted(nodes.keys())) or "(none)"
+            print(f'[ERROR] Node "{to_node}" not found')
+            print(f'  Active nodes: {active}')
+            sys.exit(1)
+        targets = [to_node]
+
+    msg = {
+        "from": from_node, "to": to_node,
+        "content": f"[btw] {message}", "at": utcnow(), "type": "btw",
+    }
+    def _do(messages):
+        messages.append(msg)
+        while len(messages) > MSG_MAX:
+            messages.pop(0)
+    state.update("messages", _do)
+    for t in targets:
+        signal_node(state.dir, t, f"btw from {from_node}")
+    state.append_log(from_node, "btw", f'{from_node} -> {to_node}: "[btw] {trunc(message, 45)}"')
+    print(f'[OK] btw sent to {to_node} ({len(targets)} node(s) notified)')
 
 
 def cmd_inbox(state: State, name: str, show_all: bool = False, limit: int = 20):
@@ -1337,9 +1387,9 @@ def cmd_interrupt(state: State, target_node: str):
 
 def cmd_nudge(state: State, target_node: str, message: str = ""):
     """Send a signal + inject a poll command into the target's console."""
-    # Always write a signal file
+    # Always write a signal file (push=False — nudge does its own full poll inject below)
     reason = message if message else "Nudge from lead"
-    signal_node(state.dir, target_node, reason)
+    signal_node(state.dir, target_node, reason, push=False)
 
     # If a message was provided, send it via collab system too
     if message:
@@ -1636,6 +1686,12 @@ examples:
     bc.add_argument("from_node", metavar="from", help="Your node name")
     bc.add_argument("message", help="Message content")
 
+    # ── btw ──
+    bw = sub.add_parser("btw", help="Async FYI note (pushed to target terminal)")
+    bw.add_argument("from_node", metavar="from", help="Your node name")
+    bw.add_argument("to", help='Target node name (or "all")')
+    bw.add_argument("message", help="FYI message content")
+
     # ── inbox ──
     ib = sub.add_parser("inbox", help="View your messages")
     ib.add_argument("name", help="Your node name")
@@ -1809,6 +1865,8 @@ def main():
             cmd_send(state, args.from_node, args.to, args.message)
         elif cmd == "broadcast":
             cmd_broadcast(state, args.from_node, args.message)
+        elif cmd == "btw":
+            cmd_btw(state, args.from_node, args.to, args.message)
         elif cmd == "inbox":
             cmd_inbox(state, args.name, args.show_all, args.limit)
         elif cmd == "context":
