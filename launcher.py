@@ -226,6 +226,35 @@ Ref: {str(COLLAB_DIR / 'PROTOCOL.md').replace(chr(92), '/')}
 _BACKUP_NAME = "_claude_md_backup"
 
 
+def pre_trust_directory(project_dir: Path):
+    """Pre-accept the Claude Code trust dialog for a directory.
+    Writes hasTrustDialogAccepted=true into ~/.claude.json so
+    instances launched into this directory skip the trust prompt."""
+    import json
+    claude_json = Path.home() / ".claude.json"
+    try:
+        if claude_json.exists():
+            data = json.loads(claude_json.read_text(encoding="utf-8"))
+        else:
+            data = {}
+
+        projects = data.setdefault("projects", {})
+        # Claude Code uses forward-slash paths as keys
+        key = str(project_dir).replace("\\", "/")
+        entry = projects.setdefault(key, {})
+        if entry.get("hasTrustDialogAccepted"):
+            return  # already trusted
+        entry["hasTrustDialogAccepted"] = True
+        claude_json.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(f"  Pre-trusted: {key}")
+    except Exception as e:
+        print(f"  [WARN] Could not pre-trust directory: {e}")
+        print(f"  You may need to accept the trust dialog manually in each window.")
+
+
 def setup_claude_md(project_dir: Path, num_nodes: int = 3, tier: str = "full"):
     """Create or update CLAUDE.md with collaboration instructions.
     Saves a backup of the original content so cleanup can restore it."""
@@ -525,6 +554,7 @@ def resume_session(project_dir: Path, tier: str):
     print()
 
     # Re-inject CLAUDE.md (state is preserved, just refresh instructions)
+    pre_trust_directory(project_dir)
     print("  Refreshing CLAUDE.md...")
     setup_claude_md(project_dir, num_nodes, tier)
 
@@ -637,7 +667,8 @@ def main():
     print("  Resetting collaboration state...")
     reset_state()
 
-    # ── Step 2: Set up CLAUDE.md ──
+    # ── Step 2: Pre-trust directory + set up CLAUDE.md ──
+    pre_trust_directory(project_dir)
     print("  Configuring CLAUDE.md...")
     setup_claude_md(project_dir, num_nodes, tier)
 
