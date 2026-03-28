@@ -55,19 +55,39 @@ When you begin a collaboration session, execute these steps in order:
 
 ## Command Reference
 
+### Command Aliases
+
+Short aliases for frequent commands — reduces token usage for Claude instances:
+
+| Alias | Command |
+|-------|---------|
+| `s` | `status` |
+| `p` | `poll` |
+| `pd` | `pending` |
+| `b` | `broadcast` |
+| `t` | `task` |
+| `c` | `context` |
+| `h` | `health` |
+| `w` | `windows` |
+| `n` | `nudge` |
+
 ### Node Management
 ```
 collab join <name> --role "<role>"           # Register as a node
 collab leave <name>                          # Deregister (releases your locks)
 collab heartbeat <name> --working-on "<w>"   # Update your current activity
 collab heartbeat <name> --status busy        # Set status: active|idle|busy|away
-collab status                                # Full overview of everything
+collab status                                # Full overview of everything (alias: s)
+collab health                                # Node health: heartbeat age, locks, tasks (alias: h)
+collab summary                               # Session report: completed work, stats
+collab validate                              # Check state file integrity
+collab validate --repair                     # Auto-fix detected issues
 ```
 
 ### Messaging
 ```
 collab send <you> <them> "<message>"         # Direct message
-collab broadcast <you> "<message>"           # Message to all nodes
+collab broadcast <you> "<message>"           # Message to all nodes (alias: b)
 collab inbox <you>                           # New messages since last poll
 collab inbox <you> --all                     # All messages ever
 collab request <you> <them> "<description>"  # Create task + notify them
@@ -75,7 +95,7 @@ collab request <you> <them> "<description>"  # Create task + notify them
 
 ### Shared Context (persistent key-value store)
 ```
-collab context set "<key>" "<value>" --by <you>     # Store a value
+collab context set "<key>" "<value>" --by <you>     # Store a value (alias: c set)
 collab context get                                   # List all entries
 collab context get "<key>"                           # Get specific value
 collab context append "<key>" "<more>" --by <you>    # Append to value
@@ -93,17 +113,24 @@ Use context for information that persists across the session:
 ```
 collab task add "<title>" --by <you>                              # Create open task
 collab task add "<title>" --assign <node> --priority high --by <you>  # Create + assign
-collab task list                                                  # All tasks
+collab task add "<title>" --depends-on 1,2 --by <you>             # With dependencies
+collab task list                                                  # All tasks (sorted by priority)
 collab task list --status open                                    # Filter by status
 collab task list --assigned <you>                                 # Your tasks
 collab task claim <you> <id>                                      # Claim an open task
 collab task update <id> active --by <you>                         # Start working
 collab task update <id> done --result "<result>" --by <you>       # Complete
 collab task update <id> blocked --result "<reason>" --by <you>    # Mark blocked
-collab task show <id>                                             # Full details
+collab task show <id>                                             # Full details + comments
+collab task comment <id> "<text>" --by <you>                      # Add a comment to a task
+collab task reassign <id> <new_node> --by <you>                   # Reassign to another node
 ```
 
 Task statuses: `open` -> `claimed` -> `active` -> `done` (or `blocked`)
+
+Tasks are sorted by: active first, then by priority (critical > high > medium > low), then by ID.
+
+Dependencies: Use `--depends-on 1,2` to declare that a task depends on others. The `poll` and `task list` commands show when a task is blocked by unfinished dependencies.
 
 ### File Coordination
 ```
@@ -114,17 +141,35 @@ collab locks                       # List all active locks
 
 Lock the specific files you're about to edit, not entire directories.
 
+**Lock expiry:** Locks automatically expire after 30 minutes. The `poll` command reports any expired locks. This prevents dead locks from blocking progress when a node crashes.
+
 ### Polling & Activity
 ```
-collab pending <you>         # Quick signal check (fast! run after every file write)
-collab poll <you>            # Everything new since your last poll (full details)
+collab pending <you>         # Quick signal check (fast! run after every file write) (alias: pd)
+collab poll <you>            # Everything new since your last poll (full details) (alias: p)
 collab log --limit 30        # Recent activity across all nodes
 ```
+
+The `poll` command now shows:
+- **Stale node warnings** — nodes with no heartbeat for >5 minutes
+- **Expired lock warnings** — locks auto-released after 30 minutes
+- **Your assigned tasks** — with priority and dependency status
+- **Messages and activity** — from other nodes since last poll
 
 **Signal files:** When someone sends you a message, assigns you a task, or broadcasts,
 a signal file is created at `state/_signal_<your-name>`. The `pending` command reads
 and clears this file. This means you can detect new work without running the heavier
 `poll` command. Run `pending` after every file write; if it shows signals, run `poll`.
+
+### JSON Output Mode
+
+Add `--json` to any command for machine-readable output:
+```
+collab --json status
+collab --json task list
+collab --json poll <name>
+```
+Useful for programmatic integration or when Claude instances need to parse structured data.
 
 ---
 
@@ -133,12 +178,15 @@ and clears this file. This means you can detect new work without running the hea
 | Situation | What to do |
 |-----------|-----------|
 | Need information from a specific node | `collab send <you> <them> "question"` |
-| Found something everyone needs to know | `collab context set "key" "value" --by <you>` |
-| Made an architectural decision | `collab broadcast <you> "Decision: ..."` |
+| Found something everyone needs to know | `collab c set "key" "value" --by <you>` |
+| Made an architectural decision | `collab b <you> "Decision: ..."` |
 | Need another node to do something | `collab request <you> <them> "description"` |
-| Finished a piece of work | `collab task update <id> done --result "summary" --by <you>` and `collab broadcast <you> "Finished X, ready for Y"` |
-| Blocked and need help | `collab broadcast <you> "Blocked on X because Y"` |
+| Finished a piece of work | `collab t update <id> done --result "summary" --by <you>` |
+| Want to comment on a task | `collab t comment <id> "note" --by <you>` |
+| Blocked and need help | `collab b <you> "Blocked on X because Y"` |
 | Switching to a different task | `collab heartbeat <you> --working-on "new task"` |
+| Check session health | `collab h` |
+| Get session report | `collab summary` |
 
 ---
 

@@ -27,7 +27,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "1.3.0"
+__version__ = "2.0.0"
 
 # ── Configuration ─────────────────────────────────────────────
 
@@ -42,6 +42,8 @@ LOCK_TIMEOUT = 5          # seconds to wait for OS file lock
 STALE_LOCK_SEC = 10       # seconds before a lock file is considered stale
 LOG_MAX = 1000            # max activity log entries
 MSG_MAX = 500             # max messages to retain
+FILE_LOCK_EXPIRY = 1800   # 30 minutes — auto-expire file locks older than this
+STALE_NODE_SEC = 300      # 5 minutes — mark node as stale if no heartbeat
 
 # Per-role identity — ANSI colors and Windows Terminal tab colors
 ROLE_STYLES = {
@@ -85,6 +87,16 @@ def trunc(s: str, n: int = 60) -> str:
     return s if len(s) <= n else s[:n - 3] + "..."
 
 
+# ── Output Modes ────────────────────────────────────────────────
+
+_json_mode = False
+_brief_mode = False
+
+def _emit_json(data: dict):
+    """Print structured JSON output and exit. Used in --json mode."""
+    print(json.dumps(data, indent=2, default=str, ensure_ascii=False))
+
+
 # ── Signal Files (push-style notification) ───────────���────────
 
 def _signal_path(state_dir: Path, node: str) -> Path:
@@ -113,232 +125,36 @@ def read_and_clear_signal(state_dir: Path, node: str) -> list:
     return lines
 
 
-# ── Window Control (Win32 API via ctypes) ────────────────────
+# ── Cross-Platform Window Control (via inject.py) ─────────────
+# Supports: Windows (Win32 API), Linux/macOS (tmux), Linux/macOS (screen)
 
-if sys.platform == "win32":
-    import ctypes
-    import ctypes.wintypes
-    import struct
-
-    kernel32 = ctypes.windll.kernel32
-
-    # Console input record constants
-    KEY_EVENT = 0x0001
-    VK_RETURN = 0x0D
-    VK_ESCAPE = 0x1B
-
-    # Console input record structure
-    class KEY_EVENT_RECORD(ctypes.Structure):
-        _fields_ = [
-            ("bKeyDown", ctypes.wintypes.BOOL),
-            ("wRepeatCount", ctypes.wintypes.WORD),
-            ("wVirtualKeyCode", ctypes.wintypes.WORD),
-            ("wVirtualScanCode", ctypes.wintypes.WORD),
-            ("uChar", ctypes.wintypes.WCHAR),
-            ("dwControlKeyState", ctypes.wintypes.DWORD),
-        ]
-
-    class INPUT_RECORD_Event(ctypes.Union):
-        _fields_ = [("KeyEvent", KEY_EVENT_RECORD)]
-
-    class INPUT_RECORD(ctypes.Structure):
-        _fields_ = [
-            ("EventType", ctypes.wintypes.WORD),
-            ("_padding", ctypes.wintypes.WORD),
-            ("Event", INPUT_RECORD_Event),
-        ]
-
-    ATTACH_PARENT_PROCESS = -1
-    STD_INPUT_HANDLE = -10
-
-    def _get_role_cmd_pids() -> dict:
-        """Map role names to their cmd.exe PIDs via WMIC."""
-        try:
-            result = subprocess.run(
-                ["wmic", "process", "where", "name='cmd.exe'",
-                 "get", "processid,commandline", "/format:csv"],
-                capture_output=True, text=True, timeout=5,
-            )
-        except Exception:
-            return {}
-        role_pids = {}
-        for line in result.stdout.strip().splitlines():
-            line = line.strip()
-            if not line or line.startswith("Node"):
-                continue
-            # CSV format: Hostname,CommandLine,ProcessId
-            # PID is always the last field (pure digits)
-            # CommandLine may contain commas, so grab last field as PID
-            # and everything between first comma and last comma as cmdline
-            first_comma = line.find(",")
-            last_comma = line.rfind(",")
-            if first_comma == -1 or first_comma == last_comma:
-                continue
-            cmdline = line[first_comma + 1 : last_comma]
-            pid_str = line[last_comma + 1 :].strip()
-            try:
-                pid = int(pid_str)
-            except ValueError:
-                continue
-            if "_run_lead.bat" in cmdline:
-                role_pids["lead"] = pid
-            elif "_run_dev1.bat" in cmdline:
-                role_pids["dev1"] = pid
-            elif "_run_dev2.bat" in cmdline:
-                role_pids["dev2"] = pid
-        return role_pids
-
-    # ── Helper script for console injection ──
-    # Spawned as a subprocess so we don't disturb our own console.
-    # Uses CONIN$ (not GetStdHandle) to get the real console input buffer.
-    _INJECTOR_SCRIPT = r'''
-import ctypes, ctypes.wintypes, sys, time
-
-KEY_EVENT = 0x0001
-GENERIC_READ  = 0x80000000
-GENERIC_WRITE = 0x40000000
-FILE_SHARE_READ  = 0x00000001
-FILE_SHARE_WRITE = 0x00000002
-OPEN_EXISTING = 3
-INVALID_HANDLE_VALUE = -1
-
-kernel32 = ctypes.windll.kernel32
-
-class KEY_EVENT_RECORD(ctypes.Structure):
-    _fields_ = [
-        ("bKeyDown", ctypes.wintypes.BOOL),
-        ("wRepeatCount", ctypes.wintypes.WORD),
-        ("wVirtualKeyCode", ctypes.wintypes.WORD),
-        ("wVirtualScanCode", ctypes.wintypes.WORD),
-        ("uChar", ctypes.wintypes.WCHAR),
-        ("dwControlKeyState", ctypes.wintypes.DWORD),
-    ]
-
-class INPUT_RECORD_Event(ctypes.Union):
-    _fields_ = [("KeyEvent", KEY_EVENT_RECORD)]
-
-class INPUT_RECORD(ctypes.Structure):
-    _fields_ = [
-        ("EventType", ctypes.wintypes.WORD),
-        ("_padding", ctypes.wintypes.WORD),
-        ("Event", INPUT_RECORD_Event),
-    ]
-
-def write_key(handle, char, vk=0):
-    """Write a key-down + key-up pair to a console input buffer."""
-    written = ctypes.wintypes.DWORD()
-    for down in (True, False):
-        rec = INPUT_RECORD()
-        rec.EventType = KEY_EVENT
-        rec.Event.KeyEvent.bKeyDown = down
-        rec.Event.KeyEvent.wRepeatCount = 1
-        rec.Event.KeyEvent.wVirtualKeyCode = vk
-        rec.Event.KeyEvent.wVirtualScanCode = 0
-        rec.Event.KeyEvent.uChar = char
-        rec.Event.KeyEvent.dwControlKeyState = 0
-        ok = kernel32.WriteConsoleInputW(handle, ctypes.byref(rec), 1, ctypes.byref(written))
-        if not ok:
-            err = ctypes.get_last_error()
-            print(f"WriteConsoleInputW failed: error={err}", file=sys.stderr)
-            return False
-    return True
-
-def open_conin():
-    """Open CONIN$ to get a direct handle to the console input buffer."""
-    handle = kernel32.CreateFileW(
-        "CONIN$",
-        GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        None,
-        OPEN_EXISTING,
-        0,
-        None,
-    )
-    if handle == INVALID_HANDLE_VALUE:
-        err = ctypes.get_last_error()
-        print(f"CreateFileW(CONIN$) failed: error={err}", file=sys.stderr)
-        return None
-    return handle
-
-def main():
-    target_pid = int(sys.argv[1])
-    action = sys.argv[2]          # "text", "escape", or "enter"
-    payload = sys.argv[3] if len(sys.argv) > 3 else ""
-
-    # Detach from our parent's console
-    kernel32.FreeConsole()
-
-    # Attach to the target's console
-    if not kernel32.AttachConsole(target_pid):
-        err = ctypes.get_last_error()
-        print(f"AttachConsole failed for PID {target_pid} (error {err})", file=sys.stderr)
-        sys.exit(1)
-
-    # Open the console input buffer directly via CONIN$
-    handle = open_conin()
-    if handle is None:
-        kernel32.FreeConsole()
-        sys.exit(1)
-
-    if action == "escape":
-        write_key(handle, '\x1b', 0x1B)
-        time.sleep(0.05)
-        write_key(handle, '\x1b', 0x1B)  # Double-tap
-
-    elif action == "text":
-        for ch in payload:
-            if ch == '\n':
-                write_key(handle, '\r', 0x0D)
-            else:
-                write_key(handle, ch, 0)
-            time.sleep(0.003)
-        # Press Enter
-        time.sleep(0.02)
-        write_key(handle, '\r', 0x0D)
-
-    elif action == "enter":
-        write_key(handle, '\r', 0x0D)
-
-    kernel32.CloseHandle(handle)
-    kernel32.FreeConsole()
-    print("OK")
-
-if __name__ == "__main__":
-    main()
-'''
-
-    def _run_injector(target_pid: int, action: str, payload: str = "") -> bool:
-        """Spawn the injector helper to write to another console."""
-        try:
-            result = subprocess.run(
-                [sys.executable, "-c", _INJECTOR_SCRIPT,
-                 str(target_pid), action, payload],
-                capture_output=True, text=True, timeout=10,
-            )
-            if result.returncode != 0:
-                stderr = result.stderr.strip()
-                if stderr:
-                    print(f"  [injector error] {stderr}")
-                return False
-            return "OK" in result.stdout
-        except Exception as e:
-            print(f"  [injector error] {e}")
-            return False
-
-    def find_collab_window(node_name: str) -> int:
-        """Find the cmd.exe PID for a collaboration node. Returns PID or 0."""
-        pids = _get_role_cmd_pids()
-        return pids.get(node_name, 0)
-
-else:
-    # Non-Windows stubs
-    def _get_role_cmd_pids():
+try:
+    from inject import get_backend as _get_injection_backend, list_all_sessions
+    _injection_backend = _get_injection_backend()
+except ImportError:
+    _injection_backend = None
+    def list_all_sessions():
         return {}
-    def _run_injector(target_pid, action, payload=""):
-        print("[ERROR] Window control only supported on Windows")
+
+def find_collab_window(node_name: str) -> str:
+    """Find the session/PID for a collaboration node. Returns session ID or empty string."""
+    if _injection_backend is None:
+        return ""
+    return _injection_backend.find_target(node_name) or ""
+
+def _run_inject(target_node: str, text: str) -> bool:
+    """Inject text into a target node's terminal."""
+    if _injection_backend is None:
+        print("[ERROR] No injection backend available (install tmux/screen on Linux/macOS)")
         return False
-    def find_collab_window(node_name):
-        return 0
+    return _injection_backend.inject(target_node, text)
+
+def _run_interrupt(target_node: str) -> bool:
+    """Send Escape to a target node's terminal."""
+    if _injection_backend is None:
+        print("[ERROR] No injection backend available (install tmux/screen on Linux/macOS)")
+        return False
+    return _injection_backend.interrupt(target_node)
 
 
 # ── File Locking ──────────────────────────────────────────────
@@ -455,7 +271,7 @@ class State:
 # ══════════════════════════════════════════════════════════════
 
 def _print_banner(name: str, role: str = ""):
-    """Print a large, color-coded role banner to visually identify the terminal."""
+    """Print a role banner to visually identify the terminal."""
     style = ROLE_STYLES.get(name, {})
     color = style.get("ansi", "\033[1;37m")
     label = style.get("label", name.upper())
@@ -470,6 +286,10 @@ def _print_banner(name: str, role: str = ""):
     # Set window title
     sys.stdout.write(f"\033]0;Collab: {label}\007")
     sys.stdout.flush()
+
+    if _brief_mode:
+        print(f"{color}[{label}]{ANSI_RESET} {desc}")
+        return
 
     w = 48
     bar = "=" * w
@@ -500,6 +320,16 @@ def cmd_whoami(state: State, name: str):
 #  COMMANDS
 # ══════════════════════════════════════════════════════════════
 
+def _touch_heartbeat(state: State, name: str):
+    """Silently update a node's heartbeat timestamp. Called automatically by
+    every command that identifies the acting node, so separate heartbeat
+    calls are unnecessary — reduces token overhead."""
+    def _do(nodes):
+        if name in nodes:
+            nodes[name]["last_heartbeat"] = utcnow()
+    state.update("nodes", _do)
+
+
 # ── Nodes ─────────────────────────────────────────────────────
 
 def cmd_join(state: State, name: str, role: str = "general"):
@@ -518,6 +348,9 @@ def cmd_join(state: State, name: str, role: str = "general"):
     was_existing = state.update("nodes", _do)
     verb = "Rejoined" if was_existing else "Joined"
     state.append_log(name, "joined", f'{name} joined as "{role}"')
+    if _json_mode:
+        return _emit_json({"command": "join", "ok": True, "name": name, "role": role,
+                           "rejoined": was_existing})
     _print_banner(name, role)
     print(f'[OK] {verb} as "{name}" (role: {role})')
 
@@ -542,15 +375,51 @@ def cmd_leave(state: State, name: str):
         print(f"     Released {len(released)} file lock(s)")
 
 
-def cmd_status(state: State):
+def cmd_status(state: State, compact: bool = False):
     nodes = state.read("nodes")
     tasks = state.read("tasks")
     ctx   = state.read("context")
     locks = state.read("locks")
     log_entries = state.read("log")
 
-    n_open = sum(1 for t in tasks.values() if t["status"] == "open")
+    if _json_mode:
+        return _emit_json({
+            "command": "status",
+            "nodes": nodes,
+            "tasks": tasks,
+            "context": ctx,
+            "locks": locks,
+            "recent_log": log_entries[-8:],
+        })
 
+    n_open = sum(1 for t in tasks.values() if t["status"] == "open")
+    n_active = sum(1 for t in tasks.values() if t["status"] == "active")
+    n_done = sum(1 for t in tasks.values() if t["status"] == "done")
+
+    if compact:
+        # ── Compact mode: dense single-line-per-item output ──
+        print(f"[status] {len(nodes)} nodes | {len(tasks)} tasks ({n_active} active, {n_done} done, {n_open} open) | {len(locks)} locks")
+        if nodes:
+            node_parts = []
+            for n in sorted(nodes.values(), key=lambda x: x.get("joined_at", "")):
+                hb = ago(n.get("last_heartbeat", ""))
+                node_parts.append(f'{n["name"]}[{n.get("status", "?")[0]}]({hb})')
+            print(f"  nodes: {', '.join(node_parts)}")
+        active_tasks = [t for t in tasks.values() if t["status"] in ("active", "claimed", "blocked")]
+        if active_tasks:
+            task_parts = []
+            for t in sorted(active_tasks, key=lambda x: x["id"]):
+                icons = {"claimed": "*", "active": ">", "blocked": "x"}
+                icon = icons.get(t["status"], "?")
+                who = t.get("assigned_to", "?") or "?"
+                task_parts.append(f'#{t["id"]}[{icon}]{who}:{trunc(t["title"], 25)}')
+            print(f"  tasks: {', '.join(task_parts)}")
+        if locks:
+            lock_parts = [f'{fp}->{info["held_by"]}' for fp, info in locks.items()]
+            print(f"  locks: {', '.join(lock_parts)}")
+        return
+
+    # ── Full mode ──
     print("=== Collaboration Status ===")
     print(f"    {len(nodes)} node(s) | {len(tasks)} task(s) ({n_open} open)"
           f" | {len(ctx)} context entries | {len(locks)} lock(s)\n")
@@ -618,7 +487,8 @@ def cmd_heartbeat(state: State, name: str, working_on=None, node_status=None):
         return True
     found = state.update("nodes", _do)
     if not found:
-        print(f'[ERROR] Node "{name}" not found -- join first')
+        print(f'[ERROR] Node "{name}" not found')
+        print(f'  Fix: run `collab join {name} --role "<your-role>"`')
         sys.exit(1)
     parts = []
     if working_on is not None:
@@ -632,9 +502,12 @@ def cmd_heartbeat(state: State, name: str, working_on=None, node_status=None):
 # ── Messages ──────────────────────────────────────────────────
 
 def cmd_send(state: State, from_node: str, to_node: str, message: str):
+    _touch_heartbeat(state, from_node)
     nodes = state.read("nodes")
     if to_node not in nodes:
+        active = ", ".join(sorted(nodes.keys())) or "(none)"
         print(f'[ERROR] Node "{to_node}" not found')
+        print(f'  Active nodes: {active}')
         sys.exit(1)
     msg = {
         "from": from_node, "to": to_node,
@@ -651,6 +524,7 @@ def cmd_send(state: State, from_node: str, to_node: str, message: str):
 
 
 def cmd_broadcast(state: State, from_node: str, message: str):
+    _touch_heartbeat(state, from_node)
     nodes = state.read("nodes")
     others = [n for n in nodes if n != from_node]
     msg = {
@@ -669,6 +543,7 @@ def cmd_broadcast(state: State, from_node: str, message: str):
 
 
 def cmd_inbox(state: State, name: str, show_all: bool = False, limit: int = 20):
+    _touch_heartbeat(state, name)
     messages = state.read("messages")
     nodes = state.read("nodes")
     last_poll = nodes.get(name, {}).get("last_poll", "1970-01-01T00:00:00+00:00")
@@ -680,6 +555,9 @@ def cmd_inbox(state: State, name: str, show_all: bool = False, limit: int = 20):
     if not show_all:
         relevant = [m for m in relevant if m["at"] > last_poll]
     relevant = relevant[-limit:]
+
+    if _json_mode:
+        return _emit_json({"command": "inbox", "node": name, "messages": relevant})
 
     if not relevant:
         print("No new messages." if not show_all else "No messages.")
@@ -697,6 +575,8 @@ def cmd_inbox(state: State, name: str, show_all: bool = False, limit: int = 20):
 # ── Context ───────────────────────────────────────────────────
 
 def cmd_context_set(state: State, key: str, value: str, by: str = "system"):
+    if by != "system":
+        _touch_heartbeat(state, by)
     def _do(ctx):
         ctx[key] = {"value": value, "set_by": by, "set_at": utcnow()}
     state.update("context", _do)
@@ -706,9 +586,16 @@ def cmd_context_set(state: State, key: str, value: str, by: str = "system"):
 
 def cmd_context_get(state: State, key=None):
     ctx = state.read("context")
+    if _json_mode:
+        if key and key not in ctx:
+            return _emit_json({"command": "context_get", "error": f"Key \"{key}\" not found"})
+        data = {key: ctx[key]} if key else ctx
+        return _emit_json({"command": "context_get", "context": data})
     if key:
         if key not in ctx:
-            print(f'[ERROR] Key "{key}" not found')
+            available = ", ".join(sorted(ctx.keys())[:10]) or "(empty)"
+            print(f'[ERROR] Context key "{key}" not found')
+            print(f'  Available keys: {available}')
             sys.exit(1)
         e = ctx[key]
         print(f"Key:   {key}")
@@ -729,13 +616,16 @@ def cmd_context_del(state: State, key: str):
         return ctx.pop(key, None) is not None
     found = state.update("context", _do)
     if not found:
-        print(f'[ERROR] Key "{key}" not found')
+        print(f'[ERROR] Context key "{key}" not found')
+        print(f'  Use `context get` to list all keys')
         sys.exit(1)
     state.append_log("system", "context_del", f'Deleted context "{key}"')
     print(f'[OK] Context "{key}" deleted')
 
 
 def cmd_context_append(state: State, key: str, value: str, by: str = "system"):
+    if by != "system":
+        _touch_heartbeat(state, by)
     def _do(ctx):
         if key in ctx:
             old = ctx[key]["value"]
@@ -750,19 +640,27 @@ def cmd_context_append(state: State, key: str, value: str, by: str = "system"):
 # ── Tasks ─────────────────────────────────────────────────────
 
 def cmd_task_add(state: State, title: str, desc: str = "", assign: str = "",
-                 priority: str = "medium", by: str = "system"):
+                 priority: str = "medium", by: str = "system",
+                 depends_on: str = ""):
+    if by != "system":
+        _touch_heartbeat(state, by)
     tid = state.next_task_id()
+    deps = [int(d.strip()) for d in depends_on.split(",") if d.strip()] if depends_on else []
     task = {
         "id": tid, "title": title, "description": desc,
         "status": "claimed" if assign else "open",
         "priority": priority, "created_by": by,
         "assigned_to": assign or None,
+        "depends_on": deps,
+        "comments": [],
         "created_at": utcnow(), "updated_at": utcnow(),
         "result": "",
         "history": [{"action": "created", "by": by, "at": utcnow()}],
     }
     if assign:
         task["history"].append({"action": f"assigned to {assign}", "by": by, "at": utcnow()})
+    if deps:
+        task["history"].append({"action": f"depends on #{', #'.join(str(d) for d in deps)}", "by": by, "at": utcnow()})
     def _do(tasks):
         tasks[str(tid)] = task
     state.update("tasks", _do)
@@ -771,17 +669,30 @@ def cmd_task_add(state: State, title: str, desc: str = "", assign: str = "",
     if assign:
         summary += f" (assigned to {assign})"
         signal_node(state.dir, assign, f"Task #{tid} assigned to you by {by}")
+    if deps:
+        summary += f" (depends on #{', #'.join(str(d) for d in deps)})"
     state.append_log(by, "task_created", summary)
     print(f"[OK] {summary}")
 
 
+_PRI_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+_STATUS_ORDER = {"active": 0, "blocked": 1, "claimed": 2, "open": 3, "done": 4}
+
 def cmd_task_list(state: State, status_filter=None, assigned_filter=None):
     tasks = state.read("tasks")
-    items = sorted(tasks.values(), key=lambda t: t["id"])
+    items = sorted(tasks.values(), key=lambda t: (
+        _STATUS_ORDER.get(t["status"], 9),
+        _PRI_ORDER.get(t.get("priority", "medium"), 9),
+        t["id"],
+    ))
     if status_filter:
         items = [t for t in items if t["status"] == status_filter]
     if assigned_filter:
         items = [t for t in items if t.get("assigned_to") == assigned_filter]
+
+    if _json_mode:
+        return _emit_json({"command": "task_list", "tasks": items})
+
     if not items:
         print("No tasks found.")
         return
@@ -793,10 +704,13 @@ def cmd_task_list(state: State, status_filter=None, assigned_filter=None):
         who = f'({t["assigned_to"]})' if t.get("assigned_to") else ""
         pri = t.get("priority", "medium")
         tag = f"  {pri.upper()}" if pri != "medium" else ""
-        print(f'  #{t["id"]:<3} [{icon}] {t["status"]:<7}  {trunc(t["title"], 38):<40} {who:<15}{tag}')
+        deps = t.get("depends_on", [])
+        dep_tag = f"  [needs #{',#'.join(str(d) for d in deps)}]" if deps else ""
+        print(f'  #{t["id"]:<3} [{icon}] {t["status"]:<7}  {trunc(t["title"], 38):<40} {who:<15}{tag}{dep_tag}')
 
 
 def cmd_task_claim(state: State, name: str, task_id: int):
+    _touch_heartbeat(state, name)
     def _do(tasks):
         k = str(task_id)
         if k not in tasks:
@@ -812,9 +726,11 @@ def cmd_task_claim(state: State, name: str, task_id: int):
     result = state.update("tasks", _do)
     if result == "not_found":
         print(f"[ERROR] Task #{task_id} not found")
+        print(f'  Use `task list` to see available tasks')
         sys.exit(1)
     if result == "already_done":
-        print(f"[ERROR] Task #{task_id} is already done")
+        print(f"[ERROR] Task #{task_id} is already done — cannot claim")
+        print(f'  Use `task show {task_id}` to see its result')
         sys.exit(1)
     state.append_log(name, "task_claimed", f"{name} claimed task #{task_id}")
     print(f'[OK] "{name}" claimed task #{task_id}')
@@ -822,6 +738,8 @@ def cmd_task_claim(state: State, name: str, task_id: int):
 
 def cmd_task_update(state: State, task_id: int, new_status: str,
                     result_text: str = "", by: str = "system"):
+    if by != "system":
+        _touch_heartbeat(state, by)
     def _do(tasks):
         k = str(task_id)
         if k not in tasks:
@@ -837,6 +755,7 @@ def cmd_task_update(state: State, task_id: int, new_status: str,
     result = state.update("tasks", _do)
     if result == "not_found":
         print(f"[ERROR] Task #{task_id} not found")
+        print(f'  Use `task list` to see available tasks')
         sys.exit(1)
     log_msg = f"Task #{task_id} -> {new_status}"
     if result_text:
@@ -849,27 +768,112 @@ def cmd_task_show(state: State, task_id: int):
     tasks = state.read("tasks")
     k = str(task_id)
     if k not in tasks:
+        if _json_mode:
+            return _emit_json({"command": "task_show", "error": f"Task #{task_id} not found"})
         print(f"[ERROR] Task #{task_id} not found")
+        print(f'  Use `task list` to see available tasks')
         sys.exit(1)
     t = tasks[k]
+
+    if _json_mode:
+        return _emit_json({"command": "task_show", "task": t})
+
     print(f'Task #{t["id"]}: {t["title"]}')
     print(f'  Status:      {t["status"]}')
     print(f'  Priority:    {t.get("priority", "medium")}')
     print(f'  Assigned:    {t.get("assigned_to") or "(unassigned)"}')
     print(f'  Created by:  {t.get("created_by", "?")} ({ago(t.get("created_at", ""))})')
+    deps = t.get("depends_on", [])
+    if deps:
+        dep_statuses = []
+        for d in deps:
+            dt = tasks.get(str(d))
+            st = dt["status"] if dt else "?"
+            dep_statuses.append(f"#{d}({st})")
+        print(f'  Depends on:  {", ".join(dep_statuses)}')
     if t.get("description"):
         print(f'  Description: {t["description"]}')
     if t.get("result"):
         print(f'  Result:      {t["result"]}')
+    comments = t.get("comments", [])
+    if comments:
+        print(f"  Comments ({len(comments)}):")
+        for c in comments:
+            print(f"    [{short_time(c['at'])}] {c['by']}: {c['text']}")
     print("  History:")
     for h in t.get("history", []):
         print(f"    [{short_time(h['at'])}] {h['action']} (by {h.get('by', '?')})")
 
 
+def cmd_task_comment(state: State, task_id: int, text: str, by: str = "system"):
+    if by != "system":
+        _touch_heartbeat(state, by)
+    def _do(tasks):
+        k = str(task_id)
+        if k not in tasks:
+            return "not_found"
+        t = tasks[k]
+        if "comments" not in t:
+            t["comments"] = []
+        t["comments"].append({"text": text, "by": by, "at": utcnow()})
+        t["updated_at"] = utcnow()
+        return "ok"
+    result = state.update("tasks", _do)
+    if result == "not_found":
+        print(f"[ERROR] Task #{task_id} not found")
+        print(f'  Use `task list` to see available tasks')
+        sys.exit(1)
+    state.append_log(by, "task_comment", f'{by} commented on task #{task_id}: "{trunc(text, 40)}"')
+    print(f"[OK] Comment added to task #{task_id}")
+
+
+def cmd_task_reassign(state: State, task_id: int, new_assignee: str, by: str = "system"):
+    if by != "system":
+        _touch_heartbeat(state, by)
+    def _do(tasks):
+        k = str(task_id)
+        if k not in tasks:
+            return "not_found"
+        t = tasks[k]
+        old = t.get("assigned_to") or "(unassigned)"
+        t["assigned_to"] = new_assignee
+        if t["status"] == "active":
+            t["status"] = "claimed"
+        t["updated_at"] = utcnow()
+        t["history"].append({"action": f"reassigned {old} -> {new_assignee}", "by": by, "at": utcnow()})
+        return old
+    result = state.update("tasks", _do)
+    if result == "not_found":
+        print(f"[ERROR] Task #{task_id} not found")
+        print(f'  Use `task list` to see available tasks')
+        sys.exit(1)
+    signal_node(state.dir, new_assignee, f"Task #{task_id} reassigned to you by {by}")
+    state.append_log(by, "task_reassigned", f"Task #{task_id} reassigned to {new_assignee}")
+    print(f"[OK] Task #{task_id} reassigned to {new_assignee}")
+
+
 # ── File Locks ────────────────────────────────────────────────
 
+def _expire_stale_locks(locks: dict) -> list:
+    """Remove locks older than FILE_LOCK_EXPIRY. Returns list of expired (file, holder)."""
+    expired = []
+    now = datetime.now(timezone.utc)
+    for fp, info in list(locks.items()):
+        try:
+            lock_age = (now - parse_ts(info["acquired_at"])).total_seconds()
+            if lock_age > FILE_LOCK_EXPIRY:
+                expired.append((fp, info["held_by"]))
+                del locks[fp]
+        except Exception:
+            pass
+    return expired
+
+
 def cmd_lock(state: State, name: str, filepath: str):
+    _touch_heartbeat(state, name)
     def _do(locks):
+        # Auto-expire stale locks
+        _expire_stale_locks(locks)
         if filepath in locks:
             holder = locks[filepath]["held_by"]
             return "yours" if holder == name else f"held:{holder}"
@@ -880,13 +884,16 @@ def cmd_lock(state: State, name: str, filepath: str):
         print(f'[OK] Already locked by you: "{filepath}"')
         return
     if result.startswith("held:"):
-        print(f'[ERROR] "{filepath}" locked by "{result[5:]}"')
+        holder = result[5:]
+        print(f'[ERROR] "{filepath}" is locked by "{holder}"')
+        print(f'  Wait for them to finish, or ask: `send {name} {holder} "Please unlock {filepath}"`')
         sys.exit(1)
     state.append_log(name, "locked", f'{name} locked "{filepath}"')
     print(f'[OK] Locked "{filepath}"')
 
 
 def cmd_unlock(state: State, name: str, filepath: str):
+    _touch_heartbeat(state, name)
     def _do(locks):
         if filepath not in locks:
             return "not_locked"
@@ -899,7 +906,9 @@ def cmd_unlock(state: State, name: str, filepath: str):
         print(f'[OK] "{filepath}" was not locked')
         return
     if result.startswith("held:"):
-        print(f'[ERROR] "{filepath}" locked by "{result[5:]}", not you')
+        holder = result[5:]
+        print(f'[ERROR] Cannot unlock "{filepath}" — locked by "{holder}", not you')
+        print(f'  Only "{holder}" can unlock it, or it will auto-expire after {FILE_LOCK_EXPIRY // 60}m')
         sys.exit(1)
     state.append_log(name, "unlocked", f'{name} unlocked "{filepath}"')
     print(f'[OK] Unlocked "{filepath}"')
@@ -907,6 +916,8 @@ def cmd_unlock(state: State, name: str, filepath: str):
 
 def cmd_locks(state: State):
     locks = state.read("locks")
+    if _json_mode:
+        return _emit_json({"command": "locks", "locks": locks})
     if not locks:
         print("No active file locks.")
         return
@@ -917,19 +928,39 @@ def cmd_locks(state: State):
 
 # ── Poll ──────────────────────────────────────────────────────
 
+def _check_stale_nodes(nodes: dict) -> list:
+    """Return list of (name, seconds_since_heartbeat) for stale nodes."""
+    stale = []
+    now = datetime.now(timezone.utc)
+    for n, info in nodes.items():
+        try:
+            hb = info.get("last_heartbeat", info.get("joined_at", ""))
+            if hb:
+                age = (now - parse_ts(hb)).total_seconds()
+                if age > STALE_NODE_SEC:
+                    stale.append((n, int(age)))
+        except Exception:
+            pass
+    return stale
+
+
 def cmd_poll(state: State, name: str):
     nodes = state.read("nodes")
     if name not in nodes:
-        print(f'[ERROR] Node "{name}" not found -- join first')
+        if _json_mode:
+            return _emit_json({"command": "poll", "error": f"Node \"{name}\" not found"})
+        print(f'[ERROR] Node "{name}" not found')
+        print(f'  Fix: run `collab join {name} --role "<your-role>"`')
         sys.exit(1)
 
     # Clear any pending signal file
-    read_and_clear_signal(state.dir, name)
+    signals = read_and_clear_signal(state.dir, name)
 
     last_poll = nodes[name].get("last_poll", "1970-01-01T00:00:00+00:00")
     messages  = state.read("messages")
     log_data  = state.read("log")
     tasks     = state.read("tasks")
+    locks     = state.read("locks")
 
     # New messages addressed to this node (or broadcast)
     new_msgs = [
@@ -945,51 +976,127 @@ def cmd_poll(state: State, name: str):
     ]
 
     # Advance last_poll + heartbeat
-    def _do(nodes):
-        if name in nodes:
-            nodes[name]["last_poll"] = utcnow()
-            nodes[name]["last_heartbeat"] = utcnow()
+    def _do(nodes_data):
+        if name in nodes_data:
+            nodes_data[name]["last_poll"] = utcnow()
+            nodes_data[name]["last_heartbeat"] = utcnow()
     state.update("nodes", _do)
 
-    if not new_msgs and not new_activity:
-        print("No updates since last check.")
-        return
+    if _json_mode:
+        my_tasks = [t for t in tasks.values()
+                    if t.get("assigned_to") == name and t["status"] not in ("done",)]
+        return _emit_json({
+            "command": "poll",
+            "node": name,
+            "new_messages": new_msgs,
+            "new_activity": new_activity,
+            "my_tasks": my_tasks,
+            "signals": signals,
+        })
 
-    print(f'=== Updates for "{name}" ===\n')
+    # Auto-expire stale locks
+    def _clean_locks(lock_data):
+        return _expire_stale_locks(lock_data)
+    expired_locks = state.update("locks", _clean_locks)
+
+    has_updates = bool(new_msgs or new_activity)
+
+    # Brief mode limits
+    msg_limit = 5 if _brief_mode else 50
+    activity_limit = 10 if _brief_mode else 25
+
+    if _brief_mode:
+        print(f'--- poll {name} ---')
+    else:
+        print(f'=== Updates for "{name}" ===\n')
+
+    # Warnings first
+    stale = _check_stale_nodes(nodes)
+    if stale:
+        for sn, sec in stale:
+            m, s = divmod(sec, 60)
+            print(f"  [!] STALE: {sn} ({m}m{s}s)")
+
+    if expired_locks:
+        for fp, holder in expired_locks:
+            print(f"  [!] LOCK EXPIRED: {fp} (was {holder})")
 
     if new_msgs:
-        print(f"Messages ({len(new_msgs)}):")
-        for m in new_msgs:
+        shown = new_msgs[-msg_limit:]
+        if len(new_msgs) > msg_limit:
+            print(f"Messages ({len(new_msgs)}, showing last {msg_limit}):")
+        else:
+            print(f"Messages ({len(new_msgs)}):")
+        for m in shown:
             src = m["from"]
-            tag = "broadcast" if m["to"] == "all" else "-> you"
-            print(f"  [{short_time(m['at'])}] {src} ({tag}): {m['content']}")
-        print()
+            tag = "bc" if m["to"] == "all" else "dm"
+            content = trunc(m['content'], 80) if _brief_mode else m['content']
+            print(f"  [{short_time(m['at'])}] {src}({tag}): {content}")
+        if not _brief_mode:
+            print()
 
     # Non-message activity from others
     other = [e for e in new_activity if e["action"] not in ("sent", "broadcast")]
     if other:
-        print(f"Activity ({len(other)}):")
-        for e in other[-25:]:
-            print(f"  [{short_time(e['at'])}] {e['summary']}")
-        print()
+        shown = other[-activity_limit:]
+        if len(other) > activity_limit:
+            print(f"Activity ({len(other)}, showing last {activity_limit}):")
+        else:
+            print(f"Activity ({len(other)}):")
+        for e in shown:
+            print(f"  [{short_time(e['at'])}] {trunc(e['summary'], 70)}")
+        if not _brief_mode:
+            print()
+
+    # Your tasks
+    my_tasks = sorted(
+        [t for t in tasks.values()
+         if t.get("assigned_to") == name and t["status"] not in ("done",)],
+        key=lambda t: (_PRI_ORDER.get(t.get("priority", "medium"), 9), t["id"]),
+    )
+    if my_tasks:
+        print(f"Your Tasks ({len(my_tasks)}):")
+        for t in my_tasks:
+            icons = {"open": "o", "claimed": "*", "active": ">", "blocked": "x"}
+            icon = icons.get(t["status"], "?")
+            pri = t.get("priority", "medium")
+            tag = f" {pri.upper()}" if pri != "medium" else ""
+            deps = t.get("depends_on", [])
+            blocked = False
+            if deps:
+                blocked = any(
+                    tasks.get(str(d), {}).get("status") != "done" for d in deps
+                )
+            block_tag = " [BLOCKED]" if blocked else ""
+            title_len = 35 if _brief_mode else 45
+            print(f"  #{t['id']:<3} [{icon}] {t['status']:<7} {trunc(t['title'], title_len)}{tag}{block_tag}")
 
     # Quick summary line
     active_nodes = [n for n in nodes.values() if n.get("status") in ("active", "busy")]
     open_tasks = [t for t in tasks.values() if t["status"] == "open"]
-    my_tasks = [t for t in tasks.values()
-                if t.get("assigned_to") == name and t["status"] not in ("done",)]
-    print(f"Summary: {len(active_nodes)} active nodes, "
-          f"{len(open_tasks)} open tasks, {len(my_tasks)} assigned to you")
+    all_my = [t for t in tasks.values()
+              if t.get("assigned_to") == name and t["status"] not in ("done",)]
+    if not _brief_mode:
+        print()
+    print(f"Summary: {len(active_nodes)} active, "
+          f"{len(open_tasks)} open, {len(all_my)} yours")
+
+    if not has_updates and not stale and not expired_locks:
+        print("  (no new activity)")
 
 
 # ── Pending (lightweight notification check) ─────────────────
 
 def cmd_pending(state: State, name: str):
     """Ultra-fast check: do I have anything waiting? Returns signal lines + counts."""
+    _touch_heartbeat(state, name)
     signals = read_and_clear_signal(state.dir, name)
     nodes = state.read("nodes")
     if name not in nodes:
-        print(f'[ERROR] Node "{name}" not found -- join first')
+        if _json_mode:
+            return _emit_json({"command": "pending", "error": f"Node \"{name}\" not found"})
+        print(f'[ERROR] Node "{name}" not found')
+        print(f'  Fix: run `collab join {name} --role "<your-role>"`')
         sys.exit(1)
 
     last_poll = nodes[name].get("last_poll", "1970-01-01T00:00:00+00:00")
@@ -1005,6 +1112,15 @@ def cmd_pending(state: State, name: str):
         t for t in tasks.values()
         if t.get("assigned_to") == name and t["status"] in ("open", "claimed")
     ]
+
+    if _json_mode:
+        return _emit_json({
+            "command": "pending",
+            "node": name,
+            "signals": signals,
+            "new_message_count": len(new_msgs),
+            "pending_task_count": len(my_pending),
+        })
 
     total = len(new_msgs) + len(my_pending)
     if signals:
@@ -1023,10 +1139,12 @@ def cmd_pending(state: State, name: str):
 
 def cmd_log(state: State, limit: int = 20):
     log_data = state.read("log")
+    entries = log_data[-limit:]
+    if _json_mode:
+        return _emit_json({"command": "log", "entries": entries})
     if not log_data:
         print("No activity yet.")
         return
-    entries = log_data[-limit:]
     print(f"Activity Log (last {len(entries)}):\n")
     for e in entries:
         print(f"  [{short_time(e['at'])}] {e['summary']}")
@@ -1035,9 +1153,12 @@ def cmd_log(state: State, limit: int = 20):
 # ── Request ───────────────────────────────────────────────────
 
 def cmd_request(state: State, from_node: str, to_node: str, description: str):
+    _touch_heartbeat(state, from_node)
     nodes = state.read("nodes")
     if to_node not in nodes:
+        active = ", ".join(sorted(nodes.keys())) or "(none)"
         print(f'[ERROR] Node "{to_node}" not found')
+        print(f'  Active nodes: {active}')
         sys.exit(1)
 
     # Create an assigned task
@@ -1076,20 +1197,119 @@ def cmd_request(state: State, from_node: str, to_node: str, description: str):
     print(f'[OK] Request sent to "{to_node}" as task #{tid}')
 
 
+# ── Health & Summary ──────────────────────────────────────────
+
+def cmd_health(state: State):
+    """Check the health of all nodes — heartbeat age, lock count, task load."""
+    nodes = state.read("nodes")
+    tasks = state.read("tasks")
+    locks = state.read("locks")
+    if _json_mode:
+        return _emit_json({"command": "health", "nodes": nodes, "tasks": tasks, "locks": locks})
+    if not nodes:
+        print("No nodes registered.")
+        return
+    now = datetime.now(timezone.utc)
+    print("=== Node Health ===\n")
+    for n, info in sorted(nodes.items()):
+        hb = info.get("last_heartbeat", info.get("joined_at", ""))
+        try:
+            hb_age = int((now - parse_ts(hb)).total_seconds())
+        except Exception:
+            hb_age = -1
+        status = info.get("status", "?")
+        stale = hb_age > STALE_NODE_SEC if hb_age >= 0 else False
+        my_locks = [f for f, v in locks.items() if v["held_by"] == n]
+        my_active = [t for t in tasks.values()
+                     if t.get("assigned_to") == n and t["status"] in ("active", "claimed")]
+        my_done = [t for t in tasks.values()
+                   if t.get("assigned_to") == n and t["status"] == "done"]
+        health = "STALE" if stale else "OK"
+        hb_str = ago(hb) if hb else "never"
+        print(f"  {n:<12} [{status:<6}] health={health}  heartbeat={hb_str}  "
+              f"tasks={len(my_active)} active/{len(my_done)} done  locks={len(my_locks)}")
+
+
+def cmd_summary(state: State):
+    """Session summary report: completed work, timelines, stats."""
+    nodes = state.read("nodes")
+    tasks = state.read("tasks")
+    messages = state.read("messages")
+    log_data = state.read("log")
+    locks = state.read("locks")
+
+    if _json_mode:
+        return _emit_json({
+            "command": "summary",
+            "nodes": nodes,
+            "tasks": tasks,
+            "message_count": len(messages),
+            "log_count": len(log_data),
+            "lock_count": len(locks),
+        })
+
+    print("=" * 52)
+    print("   Session Summary")
+    print("=" * 52)
+
+    # Task stats
+    all_tasks = list(tasks.values())
+    done = [t for t in all_tasks if t["status"] == "done"]
+    active = [t for t in all_tasks if t["status"] in ("active", "claimed")]
+    blocked = [t for t in all_tasks if t["status"] == "blocked"]
+    open_t = [t for t in all_tasks if t["status"] == "open"]
+
+    print(f"\n  Tasks: {len(all_tasks)} total — {len(done)} done, "
+          f"{len(active)} in progress, {len(blocked)} blocked, {len(open_t)} open")
+
+    # Per-node breakdown
+    if nodes:
+        print("\n  Per-Node Breakdown:")
+        for n in sorted(nodes):
+            n_done = [t for t in done if t.get("assigned_to") == n]
+            n_active = [t for t in active if t.get("assigned_to") == n]
+            print(f"    {n:<12}  {len(n_done)} done, {len(n_active)} in progress")
+
+    # Completed tasks detail
+    if done:
+        print("\n  Completed Work:")
+        for t in sorted(done, key=lambda x: x.get("updated_at", "")):
+            result = trunc(t.get("result", ""), 50)
+            who = t.get("assigned_to", "?")
+            print(f"    #{t['id']} ({who}): {trunc(t['title'], 35)} -> {result}")
+
+    # Message stats
+    print(f"\n  Messages: {len(messages)} total")
+    by_type = {}
+    for m in messages:
+        mt = m.get("type", "direct")
+        by_type[mt] = by_type.get(mt, 0) + 1
+    for mt, count in sorted(by_type.items()):
+        print(f"    {mt}: {count}")
+
+    # Active locks
+    if locks:
+        print(f"\n  Active Locks: {len(locks)}")
+        for fp, info in locks.items():
+            print(f"    {fp} -> {info['held_by']} ({ago(info.get('acquired_at', ''))})")
+
+    print()
+
+
 # ── Window Control Commands ───────────────────────────────────
 
 def cmd_inject(state: State, target_node: str, prompt: str):
     """Type a prompt into the target node's terminal and press Enter."""
-    pid = find_collab_window(target_node)
-    if not pid:
-        print(f'[ERROR] No console found for "{target_node}"')
-        print(f'  Could not find cmd.exe with _run_{target_node}.bat')
+    session = find_collab_window(target_node)
+    if not session:
+        backend_name = _injection_backend.name if _injection_backend else "none"
+        print(f'[ERROR] No console found for "{target_node}" (backend: {backend_name})')
         sys.exit(1)
 
-    print(f'  Found {target_node} console: PID {pid}')
+    print(f'  Found {target_node}: session {session} (via {_injection_backend.name})')
     print(f'  Injecting: {trunc(prompt, 80)}')
 
-    if _run_injector(pid, "text", prompt):
+    if _run_inject(target_node, prompt):
         state.append_log("lead", "inject",
                          f'Injected prompt to {target_node}: "{trunc(prompt, 40)}"')
         print(f'[OK] Prompt sent to "{target_node}"')
@@ -1100,14 +1320,14 @@ def cmd_inject(state: State, target_node: str, prompt: str):
 
 def cmd_interrupt(state: State, target_node: str):
     """Send Escape to the target node's console to stop generation."""
-    pid = find_collab_window(target_node)
-    if not pid:
+    session = find_collab_window(target_node)
+    if not session:
         print(f'[ERROR] No console found for "{target_node}"')
         sys.exit(1)
 
-    print(f'  Found {target_node} console: PID {pid}')
+    print(f'  Found {target_node}: session {session} (via {_injection_backend.name})')
 
-    if _run_injector(pid, "escape"):
+    if _run_interrupt(target_node):
         state.append_log("lead", "interrupt", f'Interrupted {target_node} (sent Escape)')
         print(f'[OK] Escape sent to "{target_node}"')
     else:
@@ -1133,13 +1353,14 @@ def cmd_nudge(state: State, target_node: str, message: str = ""):
                 messages.pop(0)
         state.update("messages", _do)
 
-    pid = find_collab_window(target_node)
-    if pid:
-        print(f'  Found {target_node} console: PID {pid}')
+    session = find_collab_window(target_node)
+    if session:
+        backend_name = _injection_backend.name if _injection_backend else "unknown"
+        print(f'  Found {target_node}: session {session} (via {backend_name})')
         # Inject a poll command so they see their updates
         collab_path = str(SCRIPT_PATH).replace("\\", "/")
         poll_cmd = f'python "{collab_path}" poll {target_node}'
-        if _run_injector(pid, "text", poll_cmd):
+        if _run_inject(target_node, poll_cmd):
             state.append_log("lead", "nudge", f'Nudged {target_node} (console + signal)')
             print(f'[OK] Nudged "{target_node}" (signal + poll injected)')
         else:
@@ -1153,25 +1374,155 @@ def cmd_nudge(state: State, target_node: str, message: str = ""):
 
 def cmd_windows(state: State):
     """List all detectable collaboration consoles."""
-    role_pids = _get_role_cmd_pids() if sys.platform == "win32" else {}
+    all_sessions = list_all_sessions()
     nodes = state.read("nodes") or {}
+    backend_name = _injection_backend.name if _injection_backend else "none"
+
+    if _json_mode:
+        return _emit_json({
+            "command": "windows",
+            "backend": backend_name,
+            "sessions": all_sessions,
+            "registered_nodes": list(nodes.keys()),
+        })
+
     # Show all known roles — both registered nodes and detected consoles
-    all_names = set(nodes.keys()) | set(role_pids.keys())
+    all_names = set(nodes.keys()) | set(all_sessions.keys())
     if not all_names:
         print("No nodes registered and no consoles detected.")
+        print(f"  Backend: {backend_name}")
         return
-    print("Collaboration Consoles:\n")
+    print(f"Collaboration Consoles (backend: {backend_name}):\n")
     for name in sorted(all_names):
-        pid = role_pids.get(name)
+        info = all_sessions.get(name)
         registered = name in nodes
-        if pid:
+        if info:
             tag = "[FOUND]" if registered else "[FOUND - not joined]"
-            print(f"  {name:<12} {tag}  cmd.exe PID {pid}")
+            print(f"  {name:<12} {tag}  {info['backend']} session {info['session']}")
         else:
             print(f"  {name:<12} [NOT FOUND]")
 
 
 # ── Reset ─────────────────────────────────────────────────────
+
+def cmd_validate(state: State, repair: bool = False):
+    """Validate state file integrity and optionally repair issues."""
+    issues = []
+    repairs = []
+
+    for name, default in _DEFAULTS.items():
+        path = state.dir / f"{name}.json"
+        if not path.exists():
+            issues.append(f"  MISSING: {name}.json")
+            if repair:
+                state._write_raw(path, default)
+                repairs.append(f"  REPAIRED: {name}.json (recreated with defaults)")
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            issues.append(f"  CORRUPT: {name}.json ({e})")
+            if repair:
+                state._write_raw(path, default)
+                repairs.append(f"  REPAIRED: {name}.json (reset to defaults)")
+            continue
+
+        # Type check
+        expected = type(default)
+        if not isinstance(data, expected):
+            issues.append(f"  WRONG TYPE: {name}.json (expected {expected.__name__}, got {type(data).__name__})")
+            if repair:
+                state._write_raw(path, default)
+                repairs.append(f"  REPAIRED: {name}.json (reset to defaults)")
+            continue
+
+    # Validate task references
+    tasks = state.read("tasks")
+    nodes = state.read("nodes")
+    for tid, task in tasks.items():
+        # Check task has required fields
+        for field in ("id", "title", "status", "created_at"):
+            if field not in task:
+                issues.append(f"  TASK #{tid}: missing field '{field}'")
+        # Check assignee exists
+        assignee = task.get("assigned_to")
+        if assignee and assignee not in nodes:
+            issues.append(f"  TASK #{tid}: assigned to '{assignee}' who is not a registered node")
+        # Check dependencies reference valid tasks
+        for dep in task.get("depends_on", []):
+            if str(dep) not in tasks:
+                issues.append(f"  TASK #{tid}: depends on #{dep} which does not exist")
+
+    # Check for orphaned lock files
+    for p in state.dir.glob("*.lock"):
+        lock_age = time.time() - p.stat().st_mtime
+        if lock_age > STALE_LOCK_SEC * 2:
+            issues.append(f"  STALE LOCK FILE: {p.name} ({int(lock_age)}s old)")
+            if repair:
+                p.unlink()
+                repairs.append(f"  REPAIRED: removed stale lock file {p.name}")
+
+    # Check for orphaned signal files
+    for p in state.dir.glob("_signal_*"):
+        sig_age = time.time() - p.stat().st_mtime
+        if sig_age > 3600:  # 1 hour
+            issues.append(f"  STALE SIGNAL: {p.name} ({int(sig_age)}s old)")
+            if repair:
+                p.unlink()
+                repairs.append(f"  REPAIRED: removed stale signal file {p.name}")
+
+    if not issues:
+        print("[OK] All state files valid. No issues found.")
+        return
+
+    print(f"=== Validation Report ({len(issues)} issue(s)) ===\n")
+    for issue in issues:
+        print(issue)
+    if repairs:
+        print(f"\n=== Repairs ({len(repairs)}) ===\n")
+        for r in repairs:
+            print(r)
+    elif issues and not repair:
+        print(f"\n  Run with --repair to auto-fix {len(issues)} issue(s)")
+
+
+_COLLAB_MARKER = "<!-- COLLAB:AUTO -->"
+
+def cmd_cleanup(state: State, project_dir: str = ""):
+    """Remove collaboration instructions from CLAUDE.md, restoring it to pre-session state."""
+    import re as _re
+    # Determine project directory
+    if project_dir:
+        pdir = Path(project_dir).resolve()
+    else:
+        pdir = Path.cwd()
+
+    claude_md = pdir / "CLAUDE.md"
+    if not claude_md.exists():
+        print("[OK] No CLAUDE.md found — nothing to clean up")
+        return
+
+    content = claude_md.read_text(encoding="utf-8")
+    if _COLLAB_MARKER not in content:
+        print("[OK] CLAUDE.md has no collaboration section — nothing to clean up")
+        return
+
+    # Remove the auto-generated section (between markers)
+    pattern = _re.compile(
+        rf"\n*{_re.escape(_COLLAB_MARKER)}.*?{_re.escape(_COLLAB_MARKER)}\n*",
+        _re.DOTALL,
+    )
+    cleaned = pattern.sub("\n", content).strip()
+
+    if cleaned:
+        claude_md.write_text(cleaned + "\n", encoding="utf-8")
+        print(f"[OK] Removed collaboration section from {claude_md}")
+        print("     Your original CLAUDE.md content is preserved")
+    else:
+        # If CLAUDE.md was entirely the collab section, remove the file
+        claude_md.unlink()
+        print(f"[OK] Removed {claude_md} (it only contained collaboration instructions)")
+
 
 def cmd_reset(state: State, confirm: bool = False):
     if not confirm:
@@ -1187,25 +1538,63 @@ def cmd_reset(state: State, confirm: bool = False):
 #  CLI PARSER
 # ══════════════════════════════════════════════════════════════
 
+# ── Command Aliases ──────────────────────────────────────────
+# Short aliases for frequent commands — saves tokens for Claude instances.
+
+ALIASES = {
+    "s":  "status",
+    "p":  "poll",
+    "pd": "pending",
+    "b":  "broadcast",
+    "t":  "task",
+    "c":  "context",
+    "h":  "health",
+    "w":  "windows",
+    "n":  "nudge",
+}
+
+
+def _expand_aliases(argv: list) -> list:
+    """Expand command aliases in sys.argv before argparse sees them."""
+    if not argv:
+        return argv
+    # Find the first non-flag argument (skip --state-dir, --version, etc.)
+    for i, arg in enumerate(argv):
+        if not arg.startswith("-"):
+            if arg in ALIASES:
+                argv = argv[:i] + [ALIASES[arg]] + argv[i + 1:]
+            break
+    return argv
+
+
 def build_parser() -> argparse.ArgumentParser:
+    alias_help = "  ".join(f"{k}={v}" for k, v in sorted(ALIASES.items()))
     p = argparse.ArgumentParser(
         prog="collab",
         description="Claude Code Collaboration Harness -- real-time multi-instance coordination",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
+aliases:
+  {alias_help}
+
 examples:
   collab join architect --role "system design"
-  collab send architect coder "The API schema is ready for review"
-  collab broadcast architect "Database migration complete"
-  collab poll coder
-  collab task add "Implement auth" --assign coder --priority high --by architect
+  collab s                                             # status (alias)
+  collab p coder                                       # poll (alias)
+  collab b architect "Database migration complete"     # broadcast (alias)
+  collab t add "Implement auth" --assign coder --priority high --by architect
+  collab task comment 3 "Looking good" --by reviewer
   collab context set "db_type" "postgresql" --by architect
-  collab request architect coder "Please review the schema in docs/schema.md"
-  collab status
+  collab health
+  collab summary
 """,
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("--state-dir", default=None, help="Override state directory path")
+    p.add_argument("--json", action="store_true", default=False,
+                   help="Output structured JSON instead of human-readable text")
+    p.add_argument("--brief", action="store_true", default=False,
+                   help="Compact output — saves context window tokens")
     sub = p.add_subparsers(dest="command", help="Available commands")
 
     # ── join ──
@@ -1218,7 +1607,15 @@ examples:
     lv.add_argument("name", help="Your node name")
 
     # ── status ──
-    sub.add_parser("status", help="Full overview: nodes, tasks, context, locks, activity")
+    st = sub.add_parser("status", help="Full overview: nodes, tasks, context, locks, activity")
+    st.add_argument("--compact", action="store_true",
+                    help="Dense single-line-per-item output (saves tokens)")
+
+    # ── health ──
+    sub.add_parser("health", help="Check health of all nodes (heartbeat, locks, tasks)")
+
+    # ── summary ──
+    sub.add_parser("summary", help="Session summary report (completed work, stats)")
 
     # ── heartbeat ──
     hb = sub.add_parser("heartbeat", help="Update your working status")
@@ -1276,6 +1673,8 @@ examples:
     ta.add_argument("--assign", default="", help="Assign to a node")
     ta.add_argument("--priority", default="medium",
                     choices=["low", "medium", "high", "critical"])
+    ta.add_argument("--depends-on", dest="depends_on", default="",
+                    help="Comma-separated task IDs this depends on")
     ta.add_argument("--by", default="system", help="Your node name")
 
     tl = tk_sub.add_parser("list", help="List tasks")
@@ -1295,6 +1694,16 @@ examples:
 
     ts = tk_sub.add_parser("show", help="Show full task details")
     ts.add_argument("task_id", type=int)
+
+    tcm = tk_sub.add_parser("comment", help="Add a comment to a task")
+    tcm.add_argument("task_id", type=int)
+    tcm.add_argument("text", help="Comment text")
+    tcm.add_argument("--by", default="system", help="Your node name")
+
+    tra = tk_sub.add_parser("reassign", help="Reassign a task to a different node")
+    tra.add_argument("task_id", type=int)
+    tra.add_argument("new_assignee", help="Node to reassign to")
+    tra.add_argument("--by", default="system", help="Your node name")
 
     # ── lock / unlock / locks ──
     lk = sub.add_parser("lock", help="Lock a file before editing")
@@ -1343,6 +1752,15 @@ examples:
     wh = sub.add_parser("whoami", help="Print the role banner to identify this terminal")
     wh.add_argument("name", help="Your node name")
 
+    # ── validate ──
+    vl = sub.add_parser("validate", help="Validate state file integrity")
+    vl.add_argument("--repair", action="store_true", help="Auto-fix detected issues")
+
+    # ── cleanup ──
+    cl = sub.add_parser("cleanup", help="Remove collaboration instructions from CLAUDE.md")
+    cl.add_argument("--project-dir", default="",
+                    help="Project directory (default: current directory)")
+
     # ── reset ──
     rs = sub.add_parser("reset", help="Clear ALL collaboration state")
     rs.add_argument("--confirm", action="store_true", help="Required to confirm reset")
@@ -1355,12 +1773,19 @@ examples:
 # ══════════════════════════════════════════════════════════════
 
 def main():
+    # Expand aliases before parsing
+    sys.argv[1:] = _expand_aliases(sys.argv[1:])
+
     parser = build_parser()
     args = parser.parse_args()
 
     if not args.command:
         parser.print_help()
         sys.exit(0)
+
+    global _json_mode, _brief_mode
+    _json_mode = args.json
+    _brief_mode = args.brief
 
     state_dir = Path(args.state_dir) if args.state_dir else DEFAULT_STATE_DIR
     state = State(state_dir)
@@ -1373,7 +1798,11 @@ def main():
         elif cmd == "leave":
             cmd_leave(state, args.name)
         elif cmd == "status":
-            cmd_status(state)
+            cmd_status(state, compact=args.compact)
+        elif cmd == "health":
+            cmd_health(state)
+        elif cmd == "summary":
+            cmd_summary(state)
         elif cmd == "heartbeat":
             cmd_heartbeat(state, args.name, args.working_on, args.node_status)
         elif cmd == "send":
@@ -1385,7 +1814,9 @@ def main():
         elif cmd == "context":
             cc = args.context_cmd
             if not cc:
-                print("[ERROR] Specify subcommand: set | get | del | append")
+                print("[ERROR] Missing subcommand for `context`")
+                print('  Usage: context {set|get|del|append} ...')
+                print('  Example: context set "db" "postgres" --by alice')
                 sys.exit(1)
             {"set":    lambda: cmd_context_set(state, args.key, args.value, args.by),
              "get":    lambda: cmd_context_get(state, args.key),
@@ -1395,15 +1826,19 @@ def main():
         elif cmd == "task":
             tc = args.task_cmd
             if not tc:
-                print("[ERROR] Specify subcommand: add | list | claim | update | show")
+                print("[ERROR] Missing subcommand for `task`")
+                print('  Usage: task {add|list|claim|update|show|comment|reassign} ...')
+                print('  Example: task add "Fix bug" --assign dev1 --by lead')
                 sys.exit(1)
-            {"add":    lambda: cmd_task_add(state, args.title, args.desc, args.assign,
-                                            args.priority, args.by),
-             "list":   lambda: cmd_task_list(state, args.status, args.assigned),
-             "claim":  lambda: cmd_task_claim(state, args.name, args.task_id),
-             "update": lambda: cmd_task_update(state, args.task_id, args.new_status,
-                                                args.result, args.by),
-             "show":   lambda: cmd_task_show(state, args.task_id),
+            {"add":      lambda: cmd_task_add(state, args.title, args.desc, args.assign,
+                                              args.priority, args.by, args.depends_on),
+             "list":     lambda: cmd_task_list(state, args.status, args.assigned),
+             "claim":    lambda: cmd_task_claim(state, args.name, args.task_id),
+             "update":   lambda: cmd_task_update(state, args.task_id, args.new_status,
+                                                  args.result, args.by),
+             "show":     lambda: cmd_task_show(state, args.task_id),
+             "comment":  lambda: cmd_task_comment(state, args.task_id, args.text, args.by),
+             "reassign": lambda: cmd_task_reassign(state, args.task_id, args.new_assignee, args.by),
             }[tc]()
         elif cmd == "lock":
             cmd_lock(state, args.name, args.file)
@@ -1429,6 +1864,10 @@ def main():
             cmd_windows(state)
         elif cmd == "whoami":
             cmd_whoami(state, args.name)
+        elif cmd == "validate":
+            cmd_validate(state, args.repair)
+        elif cmd == "cleanup":
+            cmd_cleanup(state, args.project_dir)
         elif cmd == "reset":
             cmd_reset(state, args.confirm)
 
