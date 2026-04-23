@@ -821,7 +821,20 @@ def run_wizard(initial_project_dir: Path | None = None):
         print("  Aborted.")
         sys.exit(0)
 
-    # ── Launch ──
+    _execute_launch(project_dir, lead_model, dev_model, num_devs,
+                    lead_role, dev_roles, lead_prompt or None)
+
+
+def _execute_launch(project_dir: Path, lead_model: str, dev_model: str,
+                    num_devs: int, lead_role: str, dev_roles: list,
+                    lead_prompt: str | None):
+    """Shared launch flow used by both wizard mode and flag mode.
+
+    Resets state, configures CLAUDE.md for the right tier, opens N tabs in
+    one named WT window, injects /effort max into supported tabs, and the
+    lead prompt into the lead.
+    """
+    num_nodes = num_devs + 1
     role_models = {"lead": lead_model}
     for i in range(1, num_devs + 1):
         role_models[f"dev{i}"] = dev_model
@@ -848,7 +861,7 @@ def run_wizard(initial_project_dir: Path | None = None):
             time.sleep(2)
 
     print(f"\n  All tabs requested. Polling for sessions to inject startup...")
-    inject_startup(role_models, lead_prompt or None)
+    inject_startup(role_models, lead_prompt)
 
     print(f"""
   ==========================================
@@ -859,6 +872,75 @@ def run_wizard(initial_project_dir: Path | None = None):
   Stop:      ccollab --stop
   Resume:    ccollab --resume
 """)
+
+
+def run_flag_mode(args):
+    """Non-interactive launch from CLI flags. Designed to be invoked from
+    inside another Claude Code session via Bash, or from any scripted context.
+    Missing optional flags fall back to sensible defaults; missing required
+    flags abort with a clear error.
+    """
+    # Project dir defaults to cwd
+    project_dir = Path(args.project_dir).resolve() if args.project_dir else Path.cwd()
+    if not project_dir.is_dir():
+        print(f"  [ERROR] Not a directory: {project_dir}")
+        sys.exit(1)
+
+    # Fill defaults
+    lead_model = args.lead_model or "opus"
+    dev_model  = args.dev_model  or lead_model
+    dev_roles_in = args.dev_role or []
+
+    # Determine number of devs: --devs wins if set, else infer from --dev-role count, else 2
+    if args.devs is not None:
+        num_devs = max(1, args.devs)
+    elif dev_roles_in:
+        num_devs = len(dev_roles_in)
+    else:
+        num_devs = 2
+
+    # Pad / truncate dev roles to match num_devs
+    dev_roles = list(dev_roles_in)
+    while len(dev_roles) < num_devs:
+        idx = len(dev_roles) + 1
+        default = "Primary implementation" if idx == 1 else \
+                  "Review and testing"     if idx == 2 else \
+                  f"Development node {idx}"
+        dev_roles.append(default)
+    dev_roles = dev_roles[:num_devs]
+
+    lead_role = args.lead_role or "Coordination, architecture, and task management"
+    lead_prompt = args.prompt or None
+
+    # Echo what we're about to do — visible in Bash tool output
+    print()
+    print("=" * 52)
+    print("   ccollab — flag mode (non-interactive)")
+    print("=" * 52)
+    print(f"    project   : {project_dir}")
+    print(f"    lead      : {lead_model}    role: {lead_role}")
+    print(f"    devs ({num_devs}) : {dev_model}")
+    for i, r in enumerate(dev_roles, 1):
+        print(f"      dev{i}    role: {r}")
+    if lead_prompt:
+        preview = lead_prompt if len(lead_prompt) < 70 else lead_prompt[:67] + "..."
+        print(f"    prompt    : {preview}")
+    else:
+        print(f"    prompt    : (none — type manually in lead window)")
+
+    # Confirmation: required unless --yes
+    if not args.yes:
+        try:
+            confirm = input("\n  Proceed? [y/N]: ").strip().lower()
+        except EOFError:
+            print("\n  [ERROR] No TTY for confirmation. Pass --yes for non-interactive use.")
+            sys.exit(2)
+        if confirm not in ("y", "yes"):
+            print("  Aborted.")
+            sys.exit(0)
+
+    _execute_launch(project_dir, lead_model, dev_model, num_devs,
+                    lead_role, dev_roles, lead_prompt)
 
 
 def main():
@@ -879,7 +961,33 @@ def main():
                         help="Resume a previous session — re-launch terminals, preserve state")
     parser.add_argument("--no-wizard", action="store_true",
                         help="Skip the interactive wizard even when no flags are given (use legacy flow)")
+
+    # Non-interactive flag mode — supply all wizard answers as flags
+    parser.add_argument("--lead-model", default=None,
+                        help="Lead model ID (e.g. opus, sonnet, claude-opus-4-7)")
+    parser.add_argument("--dev-model", default=None,
+                        help="Subordinate model ID applied to all devs")
+    parser.add_argument("--devs", type=int, default=None,
+                        help="Number of subordinate (dev) nodes")
+    parser.add_argument("--lead-role", default=None,
+                        help="Free-text role description for the lead")
+    parser.add_argument("--dev-role", action="append", default=None,
+                        help="Free-text role for a dev (repeat once per dev, in order)")
+    parser.add_argument("--prompt", default=None,
+                        help="Initial prompt to inject into the lead tab after launch")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="Skip the confirmation prompt (required for non-interactive use)")
+
     args = parser.parse_args()
+
+    # ── Flag mode: triggered when any non-interactive launch flag is set ──
+    flag_mode = any(v is not None for v in (
+        args.lead_model, args.dev_model, args.devs,
+        args.lead_role, args.dev_role, args.prompt,
+    ))
+    if flag_mode and not args.stop and not args.resume:
+        run_flag_mode(args)
+        return
 
     # ── Wizard mode: default when invoked with no flags / no nodes override ──
     invoked_bare = (
